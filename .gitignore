@@ -4,3 +4,4 @@ __pycache__/
 storage/
 .env
 .pytest_cache/
+.superpowers/
