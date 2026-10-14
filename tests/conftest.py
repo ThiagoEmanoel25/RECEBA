@@ -1,26 +1,58 @@
 import datetime as dt
+import os
 import warnings
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from app import db
 
 warnings.filterwarnings("ignore", message=".*does \\*not\\* support Decimal.*")
 
 TODAY = dt.date(2026, 10, 9)
+TEST_DATABASE_URL = os.getenv(
+    "TEST_DATABASE_URL", "postgresql+psycopg://receba:receba@localhost:5433/receba_test"
+)
+SKIP_MESSAGE = (
+    f"Postgres com pgvector indisponivel em {TEST_DATABASE_URL}. "
+    "Suba com: docker compose up -d db"
+)
+
+
+@pytest.fixture(scope="session")
+def engine():
+    """Schema criado uma vez por sessao de teste; cada teste roda em transacao propria."""
+    eng = create_engine(TEST_DATABASE_URL, future=True)
+    try:
+        with eng.begin() as connection:
+            connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+    except SQLAlchemyError as exc:
+        eng.dispose()
+        pytest.skip(f"{SKIP_MESSAGE} ({exc.__class__.__name__})")
+    db.Base.metadata.drop_all(eng)
+    db.Base.metadata.create_all(eng)
+    yield eng
+    eng.dispose()
 
 
 @pytest.fixture()
-def session():
-    engine = create_engine(
-        "sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False}
-    )
-    db.Base.metadata.create_all(engine)
-    with sessionmaker(engine, expire_on_commit=False, future=True)() as s:
+def connection(engine):
+    """Transacao externa com rollback no fim: os commits do app viram savepoints."""
+    conn = engine.connect()
+    transaction = conn.begin()
+    yield conn
+    transaction.rollback()
+    conn.close()
+
+
+@pytest.fixture()
+def session(connection):
+    with Session(
+        bind=connection, expire_on_commit=False, join_transaction_mode="create_savepoint"
+    ) as s:
         yield s
 
 

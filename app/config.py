@@ -3,7 +3,9 @@ import json
 import os
 from decimal import Decimal
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./receba.db")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL", "postgresql+psycopg://receba:receba@localhost:5433/receba"
+)
 STORAGE_DIR = os.getenv("STORAGE_DIR", "./storage")
 
 # chave -> perfil (ADMIN / ANALYST / FINANCIAL_APPROVER / VIEWER)
@@ -36,3 +38,9 @@ DUE_DATE_TOLERANCE_DAYS = int(os.getenv("DUE_DATE_TOLERANCE_DAYS", 10))
 # ---- batch ----------------------------------------------------------------
 BATCH_MAX_CANDIDATES = int(os.getenv("BATCH_MAX_CANDIDATES", 15))
 BATCH_MAX_ITEMS = int(os.getenv("BATCH_MAX_ITEMS", 4))
+
+# ---- memoria / RAG -------------------------------------------------------
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "voyage-3.5")
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", 1024))
+RETRIEVE_CANDIDATES = int(os.getenv("RETRIEVE_CANDIDATES", 20))  # top-N por canal antes do RRF
+HISTORY_HITS = int(os.getenv("HISTORY_HITS", 5))  # memorias de match lidas por transacao

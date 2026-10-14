@@ -5,6 +5,9 @@ pydantic==2.10.4
 python-multipart==0.0.20
 pypdf==5.1.0
 psycopg[binary]==3.2.3
+pgvector==0.5.1
+langchain-core==1.6.10
+langchain-voyageai==0.4.1
 anthropic==0.42.0
 pytest==8.3.4
 httpx==0.28.1

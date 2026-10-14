@@ -15,6 +15,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -294,6 +295,8 @@ SessionLocal = sessionmaker(engine, expire_on_commit=False, future=True)
 
 def init_db() -> None:
     # ponytail: create_all no lugar de Alembic; trocar por migrations antes do primeiro deploy.
+    with engine.begin() as connection:
+        connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
     Base.metadata.create_all(engine)
 
 

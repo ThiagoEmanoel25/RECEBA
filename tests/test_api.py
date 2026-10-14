@@ -4,9 +4,7 @@ from decimal import Decimal
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.orm import Session, sessionmaker
 
 from app import db
 from app.main import app
@@ -23,12 +21,14 @@ NOTA = (
 
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch):
-    engine = create_engine(
-        "sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False}
+def client(connection, tmp_path, monkeypatch):
+    Local = sessionmaker(
+        bind=connection,
+        class_=Session,
+        expire_on_commit=False,
+        future=True,
+        join_transaction_mode="create_savepoint",
     )
-    db.Base.metadata.create_all(engine)
-    Local = sessionmaker(engine, expire_on_commit=False, future=True)
     monkeypatch.setattr("app.main.STORAGE_DIR", str(tmp_path))
     monkeypatch.setitem(db.__dict__, "SessionLocal", Local)
     monkeypatch.setattr("app.main.init_db", lambda: None)
@@ -43,18 +43,18 @@ def client(tmp_path, monkeypatch):
 
     API_KEYS["viewer-key"] = "VIEWER"
     with Local() as session:
-        session.add_all([
-            db.Supplier(name="ACME LTDA", cnpj="11222333000181"),
-            db.BankAccount(company="EMPRESA", bank_code="001", agency="1", account="1"),
-        ])
+        supplier = db.Supplier(name="ACME LTDA", cnpj="11222333000181")
+        account = db.BankAccount(company="EMPRESA", bank_code="001", agency="1", account="1")
+        session.add_all([supplier, account])
         session.flush()
         session.add_all([
-            db.SupplierBankAccount(supplier_id=1, bank_code="341", agency="4321",
+            db.SupplierBankAccount(supplier_id=supplier.id, bank_code="341", agency="4321",
                                    account="98765", active=True),
-            db.PurchaseOrder(number="771", supplier_id=1),
+            db.PurchaseOrder(number="771", supplier_id=supplier.id),
         ])
         session.commit()
     with TestClient(app) as test_client:
+        test_client.bank_account_id = account.id  # ids vem de sequence, nao sao fixos
         yield test_client
     app.dependency_overrides.clear()
     API_KEYS.pop("viewer-key", None)
@@ -106,7 +106,7 @@ def test_fluxo_completo(client):
         "date;amount;description\n09/10/2026;-7500,00;Pgto Forn. ACME Inv-44120\n"
     ).encode()
     imported = client.post(
-        "/bank-transactions/import?bank_account_id=1", headers=HEADERS,
+        f"/bank-transactions/import?bank_account_id={client.bank_account_id}", headers=HEADERS,
         files={"file": ("extrato.csv", csv_bytes, "text/csv")},
     ).json()
     assert imported["imported"] == 1
@@ -120,12 +120,12 @@ def test_fluxo_completo(client):
 
     client.post(
         "/bank-accounts/balances", headers=HEADERS,
-        json={"bank_account_id": 1, "balance_date": str(TODAY),
+        json={"bank_account_id": client.bank_account_id, "balance_date": str(TODAY),
               "opening_balance": "10000.00", "closing_balance": "2500.00"},
     )
     reconciliation = client.post(
         "/reconciliations/run", headers=HEADERS,
-        json={"bank_account_id": 1, "reconciliation_date": str(TODAY)},
+        json={"bank_account_id": client.bank_account_id, "reconciliation_date": str(TODAY)},
     ).json()
     assert reconciliation["status"] == "RECONCILED", reconciliation["findings"]
 
@@ -139,11 +139,12 @@ def test_fluxo_completo(client):
 
 
 def test_aprovacao_exige_perfil_aprovador(client):
-    client.post(
-        "/bank-transactions/import?bank_account_id=1&run_matching=false", headers=HEADERS,
+    imported = client.post(
+        f"/bank-transactions/import?bank_account_id={client.bank_account_id}&run_matching=false",
+        headers=HEADERS,
         files={"file": ("e.csv",
                         b"date;amount;description\n09/10/2026;-50,00;PGTO SEM REFERENCIA\n",
                         "text/csv")},
-    )
-    response = client.post("/matching/1/run", headers=HEADERS).json()
+    ).json()
+    response = client.post(f"/matching/{imported['ids'][0]}/run", headers=HEADERS).json()
     assert response["status"] == "UNMATCHED"
