@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app import memory
 from app.db import BankBalance, BankTransaction, audit
 from app.parser import normalize, parse_observation
 
@@ -39,6 +40,20 @@ def _date(raw: str) -> dt.date:
     raise ValueError(f"Data invalida: {raw!r}")
 
 
+def _embed_pending(session: Session, transactions: list[BankTransaction]) -> int:
+    """Embeddings em lote: a Voyage aceita varios textos de uma vez, o matching nao espera API."""
+    if not transactions:
+        return 0
+    vectors = memory.embed([t.description_normalized or "" for t in transactions])
+    if vectors is None:
+        audit(session, "bank_account", transactions[0].bank_account_id, "MEMORY_DEGRADED",
+              reason="embedding_indisponivel", transactions=len(transactions))
+        return 0
+    for transaction, vector in zip(transactions, vectors):
+        transaction.embedding = vector
+    return len(transactions)
+
+
 def import_csv(session: Session, bank_account_id: int, content: bytes) -> dict:
     text = content.decode("utf-8-sig")
     sample = text[:2048]
@@ -49,7 +64,7 @@ def import_csv(session: Session, bank_account_id: int, content: bytes) -> dict:
     if missing:
         raise ValueError(f"CSV sem colunas obrigatorias: {sorted(missing)}")
 
-    created, duplicated = [], 0
+    created, duplicated, pending = [], 0, []
     for line, raw_row in enumerate(reader, start=2):
         row = {(k or "").strip().lower(): (v or "").strip() for k, v in raw_row.items()}
         if not any(row.values()):
@@ -98,9 +113,16 @@ def import_csv(session: Session, bank_account_id: int, content: bytes) -> dict:
         audit(session, "bank_transaction", transaction.id, "TRANSACTION_IMPORTED",
               external_id=external_id)
         created.append(transaction.id)
+        pending.append(transaction)
 
+    embedded = _embed_pending(session, pending)
     session.commit()
-    return {"imported": len(created), "duplicated": duplicated, "ids": created}
+    return {
+        "imported": len(created),
+        "duplicated": duplicated,
+        "embedded": embedded,
+        "ids": created,
+    }
 
 
 def set_balance(
