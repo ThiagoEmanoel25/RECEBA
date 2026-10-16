@@ -4,6 +4,7 @@ from decimal import Decimal
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app import db, memory
@@ -292,7 +293,8 @@ def test_aprovacao_de_match_grava_memoria_episodica(client, session, company, ma
     resposta = client.post(f"/matching/{transaction.id}/approve", headers=HEADERS)
     assert resposta.status_code == 200, resposta.text
 
-    hits = memory.retrieve(session, MATCH_DECISION, DESC_MATCH)
+    hits = memory.retrieve(session, MATCH_DECISION, DESC_MATCH,
+                           filters={"supplier_id": company["supplier"].id})
     assert hits, "aprovacao humana deve virar memoria"
     item = hits[0].item
     assert item.item_metadata == {
@@ -329,3 +331,59 @@ def test_rejeicao_de_match_grava_memoria_negativa(client, session, company, make
     assert item.item_metadata["reason"] == "fornecedor errado"
     assert item.item_metadata["entity_id"] == payable.id
     assert item.supplier_id == company["supplier"].id
+
+
+def test_aprovacao_de_recebivel_grava_customer_id(client, session, company, make_transaction):
+    receivable = db.Receivable(customer_id=company["customer"].id, invoice_number="9001",
+                               amount_original=Decimal("1200.00"),
+                               amount_open=Decimal("1200.00"), due_date=TODAY)
+    session.add(receivable)
+    session.commit()
+    transaction = make_transaction("1200.00", "RECEBIMENTO BETA NF 9001", direction="CREDIT")
+    run = client.post(f"/matching/{transaction.id}/run?auto_settle=false",
+                      headers=HEADERS).json()
+    assert run["group_id"], run
+
+    assert client.post(f"/matching/{transaction.id}/approve", headers=HEADERS).status_code == 200
+
+    hits = memory.retrieve(session, MATCH_DECISION, "RECEBIMENTO BETA NF 9001",
+                           filters={"customer_id": company["customer"].id})
+    assert hits
+    item = hits[0].item
+    assert item.customer_id == company["customer"].id
+    assert item.supplier_id is None
+    assert item.item_metadata["entity_type"] == "RECEIVABLE"
+    assert item.item_metadata["entity_id"] == receivable.id
+    assert item.amount == Decimal("1200.00")
+
+
+def test_lote_grava_uma_memoria_por_titulo_com_valor_proprio(client, session, company,
+                                                             make_payable, make_transaction):
+    outro = db.Supplier(name="OUTRO FORNECEDOR", cnpj="99888777000166")
+    session.add(outro)
+    session.commit()
+    p1 = make_payable("111", "3000.00")
+    p2 = db.Payable(supplier_id=outro.id, invoice_number="222",
+                    amount_original=Decimal("4500.00"), amount_open=Decimal("4500.00"),
+                    due_date=TODAY)
+    session.add(p2)
+    session.commit()
+    transaction = make_transaction("7500.00", "PAGAMENTO LOTE FORNECEDORES")
+    run = client.post(f"/matching/{transaction.id}/run?auto_settle=false",
+                      headers=HEADERS).json()
+    assert run["group_type"] == "BATCH_PAYMENT", run
+
+    assert client.post(f"/matching/{transaction.id}/approve", headers=HEADERS).status_code == 200
+
+    itens = session.scalars(
+        select(db.MemoryItem).where(db.MemoryItem.kind == MATCH_DECISION,
+                                    db.MemoryItem.source_id == run["group_id"])
+    ).all()
+    por_titulo = {i.item_metadata["entity_id"]: i for i in itens}
+    assert set(por_titulo) == {p1.id, p2.id}
+    assert por_titulo[p1.id].supplier_id == company["supplier"].id
+    assert por_titulo[p1.id].amount == Decimal("3000.00")
+    assert por_titulo[p1.id].item_metadata["amount"] == "3000.00"
+    assert por_titulo[p2.id].supplier_id == outro.id
+    assert por_titulo[p2.id].amount == Decimal("4500.00")
+    assert por_titulo[p2.id].item_metadata["amount"] == "4500.00"

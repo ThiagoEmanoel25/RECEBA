@@ -22,6 +22,7 @@ from app.db import (
     ExtractedDocument,
     MATCH_DECISION,
     MatchingCandidate,
+    MemoryItem,
     Payable,
     Receivable,
     ReconciliationGroup,
@@ -539,48 +540,52 @@ def _remember_match(
     *,
     actor: Actor,
     reason: str | None = None,
-):
-    """Decisao humana de match vira memoria episodica, com a parte envolvida como chave."""
+) -> list[MemoryItem]:
+    """Decisao humana de match vira memoria episodica: uma por titulo, com a parte como chave."""
     transaction = session.get(BankTransaction, group.bank_transaction_id)
-    item = session.scalar(
+    if transaction is None:
+        return []
+    items = session.scalars(
         select(ReconciliationGroupItem).where(
             ReconciliationGroupItem.reconciliation_group_id == group.id,
             ReconciliationGroupItem.entity_type.in_(("PAYABLE", "RECEIVABLE")),
         ).order_by(ReconciliationGroupItem.id)
-    )
-    if transaction is None or item is None:
-        return None
+    ).all()
 
-    # a parte (fornecedor/cliente) e a chave que a pontuacao usa depois: o titulo ja baixado
-    # nunca volta como candidato aberto.
-    supplier_id = customer_id = None
-    if item.entity_type == "PAYABLE":
-        title = session.get(Payable, item.entity_id)
-        supplier_id = title.supplier_id if title else None
-    else:
-        title = session.get(Receivable, item.entity_id)
-        customer_id = title.customer_id if title else None
-
-    return memory.remember(
-        session,
-        MATCH_DECISION,
-        transaction.description_normalized or transaction.description_raw or "",
-        item_metadata={
-            "decision": decision,
-            "entity_type": item.entity_type,
-            "entity_id": item.entity_id,
-            "group_type": group.group_type,
-            "amount": str(transaction.amount),
-            "reason": reason,
-            "actor": actor.key,
-        },
-        source_entity="reconciliation_group",
-        source_id=group.id,
-        supplier_id=supplier_id,
-        customer_id=customer_id,
-        bank_account_id=transaction.bank_account_id,
-        amount=Decimal(transaction.amount),
-    )
+    memories = []
+    for item in items:
+        # a parte (fornecedor/cliente) e a chave que a pontuacao usa depois: o titulo ja
+        # baixado nunca volta como candidato aberto. Sem parte, a memoria seria inutil.
+        supplier_id = customer_id = None
+        if item.entity_type == "PAYABLE":
+            title = session.get(Payable, item.entity_id)
+            supplier_id = title.supplier_id if title else None
+        else:
+            title = session.get(Receivable, item.entity_id)
+            customer_id = title.customer_id if title else None
+        if supplier_id is None and customer_id is None:
+            continue
+        memories.append(memory.remember(
+            session,
+            MATCH_DECISION,
+            transaction.description_normalized or transaction.description_raw or "",
+            item_metadata={
+                "decision": decision,
+                "entity_type": item.entity_type,
+                "entity_id": item.entity_id,
+                "group_type": group.group_type,
+                "amount": str(item.amount_allocated),
+                "reason": reason,
+                "actor": actor.key,
+            },
+            source_entity="reconciliation_group",
+            source_id=group.id,
+            supplier_id=supplier_id,
+            customer_id=customer_id,
+            bank_account_id=transaction.bank_account_id,
+            amount=Decimal(item.amount_allocated),
+        ))
+    return memories
 
 
 @app.get("/reconciliation-groups/{group_id}")
