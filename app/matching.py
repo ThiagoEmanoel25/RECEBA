@@ -35,7 +35,20 @@ UNMATCHED = "UNMATCHED"
 # Referencias de peso alto: so elas liberam baixa parcial/ajuste automatico.
 STRONG_SIGNALS = {"invoice", "bl", "container"}
 
+# Razoes que vem so da memoria: nunca entram em baixa automatica (nao decidiram nada).
+HISTORY_REASONS = {"history", "history_rejected"}
+
 logger = logging.getLogger(__name__)
+
+
+def _base_reasons(reasons: list[str]) -> list[str]:
+    """Razoes do documento, sem as da memoria. Usado onde o sistema baixa sozinho."""
+    return [r for r in reasons if r not in HISTORY_REASONS]
+
+
+def _base_order(pool: list["Scored"]) -> list["Scored"]:
+    """Ordem total pelo score base (id desempata): a memoria nunca decide posicao aqui."""
+    return sorted(pool, key=lambda c: (-c.score, c.amount_open, c.id))
 
 
 @dataclass(slots=True)
@@ -139,6 +152,10 @@ def apply_history(session: Session, transaction: BankTransaction, pool: list[Sco
     # Uma decisao por parte (setdefault): rejeicao repetida grava memoria duplicada e o
     # lote aprovado grava varias memorias com o mesmo texto; nada disso pode acumular peso.
     # So conta hit lexical: o canal semantico devolve vizinhos mesmo sem relacao real.
+    # ponytail: plainto_tsquery faz AND de todos os termos da descricao atual; com extrato real
+    # (NF/NSU/data variando) quase nunca dispara. Upgrade: Hit levar a distancia cosseno para
+    # aceitar hit semantico acima de um limiar, e/ou websearch_to_tsquery no lado lexical.
+    # Conflito APPROVED x REJECTED na mesma parte: rejeicao vence (conservador), nao a mais antiga.
     by_party: dict[tuple[str, int], str] = {}
     for hit in hits:
         if "lexical" not in hit.via:
@@ -148,8 +165,8 @@ def apply_history(session: Session, transaction: BankTransaction, pool: list[Sco
             continue
         for column, value in (("supplier", hit.item.supplier_id),
                               ("customer", hit.item.customer_id)):
-            if value is not None:
-                by_party.setdefault((column, value), decision)
+            if value is not None and (decision == "REJECTED" or (column, value) not in by_party):
+                by_party[(column, value)] = decision
     if not by_party:
         return
 
@@ -193,7 +210,7 @@ def candidates(session: Session, transaction: BankTransaction) -> list[Scored]:
         if value > 0:
             scored.append(Scored(entity_type, row, value, reasons))
     apply_history(session, transaction, scored)
-    scored.sort(key=lambda s: (-s.effective, s.amount_open))
+    scored.sort(key=lambda s: (-s.effective, s.amount_open, s.id))
     return scored
 
 
@@ -233,7 +250,8 @@ def evaluate(session: Session, transaction: BankTransaction) -> tuple[MatchResul
 
     best = pool[0]
     # Auto-match olha so o score base: a memoria nao escolhe nem desempata baixa automatica.
-    base_best = min(pool, key=lambda c: (-c.score, c.amount_open))
+    base_order = _base_order(pool)
+    base_best = base_order[0]
     tied = [c for c in pool if c.score == base_best.score]
 
     # 1) Exact Match: referencia forte unica + valor exato (spec secoes 15 e 16).
@@ -242,7 +260,7 @@ def evaluate(session: Session, transaction: BankTransaction) -> tuple[MatchResul
         hit = exact[0]
         return (
             MatchResult(AUTO_MATCHED, "SINGLE", [(hit.entity_type, hit.id, amount)],
-                        hit.score, hit.reasons),
+                        hit.score, _base_reasons(hit.reasons)),
             pool,
         )
     if len(exact) > 1:
@@ -262,7 +280,7 @@ def evaluate(session: Session, transaction: BankTransaction) -> tuple[MatchResul
             )
         return (
             MatchResult(AUTO_MATCHED, "SINGLE", [(base_best.entity_type, base_best.id, amount)],
-                        base_best.score, base_best.reasons),
+                        base_best.score, _base_reasons(base_best.reasons)),
             pool,
         )
 
@@ -277,7 +295,7 @@ def evaluate(session: Session, transaction: BankTransaction) -> tuple[MatchResul
                 MatchResult(
                     MATCH_WITH_ADJUSTMENT, "ADJUSTMENT",
                     [(best.entity_type, best.id, best.amount_open), (kind, None, difference)],
-                    best.score, best.reasons + [kind.lower()], difference,
+                    best.score, _base_reasons(best.reasons) + [kind.lower()], difference,
                 ),
                 pool,
             )
@@ -287,20 +305,20 @@ def evaluate(session: Session, transaction: BankTransaction) -> tuple[MatchResul
                     MATCH_WITH_ADJUSTMENT, "ADJUSTMENT",
                     [(best.entity_type, best.id, best.amount_open),
                      ("DISCOUNT", None, difference)],
-                    best.score, best.reasons + ["discount"], difference,
+                    best.score, _base_reasons(best.reasons) + ["discount"], difference,
                 ),
                 pool,
             )
         if difference < 0:
             return (
                 MatchResult(PARTIALLY_PAID, "PARTIAL", [(best.entity_type, best.id, amount)],
-                            best.score, best.reasons, difference),
+                            best.score, _base_reasons(best.reasons), difference),
                 pool,
             )
 
     # 4) lote
     # Lote baixa sozinho: o corte por BATCH_MAX_CANDIDATES segue a ordem do score base.
-    batches = find_batches(amount, sorted(pool, key=lambda c: (-c.score, c.amount_open)))
+    batches = find_batches(amount, base_order)
     if len(batches) == 1:
         group = batches[0]
         group_type = "BATCH_PAYMENT" if transaction.direction == "DEBIT" else "BATCH_RECEIPT"
@@ -308,8 +326,8 @@ def evaluate(session: Session, transaction: BankTransaction) -> tuple[MatchResul
             MatchResult(
                 MATCHED_BATCH, group_type,
                 [(item.entity_type, item.id, item.amount_open) for item in group],
-                min(item.effective for item in group),
-                sorted({r for item in group for r in item.reasons}),
+                min(item.score for item in group),
+                sorted({r for item in group for r in _base_reasons(item.reasons)}),
             ),
             pool,
         )

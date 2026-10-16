@@ -518,16 +518,88 @@ def test_history_sozinho_nao_gera_auto_match(session, company, make_payable, mak
 
 def test_history_promove_unmatched_para_revisao(session, company, make_payable,
                                                 make_transaction):
+    """Base 60 (cnpj+amount+party+date) fica abaixo de REVIEW_MIN; +10 de memoria promove."""
     payable = make_payable("44120", "500.00")
-    transaction = make_transaction("777.00", "TRANSFERENCIA ACME MENSAL")
+    descricao = "TRANSFERENCIA ACME 11222333000181"
+    transaction = make_transaction("500.00", descricao)
     sem_memoria, _ = matching.evaluate(session, transaction)
+    assert sem_memoria.status == matching.UNMATCHED and sem_memoria.confidence == 60
 
-    _memoria_de_match(session, company, payable, "APPROVED", "TRANSFERENCIA ACME MENSAL")
+    _memoria_de_match(session, company, payable, "APPROVED", descricao)
     com_memoria, pool = matching.evaluate(session, transaction)
+    assert com_memoria.status == matching.REVIEW_REQUIRED
+    assert com_memoria.confidence == 70 and pool[0].score == 60
 
-    assert sem_memoria.confidence < com_memoria.confidence
-    if sem_memoria.status == matching.UNMATCHED:
-        assert com_memoria.status in {matching.UNMATCHED, matching.REVIEW_REQUIRED}
+
+def test_ceiling_history_nao_libera_auto_match_com_effective_alto(
+    session, company, make_payable, make_transaction, monkeypatch
+):
+    """Base 85 + amount presente; effective 95 >= AUTO_MATCH_MIN. Auto-match le so o base."""
+    monkeypatch.setattr(matching.config, "WEIGHTS", {"party": 85, "history": 10})
+    payable = make_payable("44120", "500.00")
+    descricao = "TRANSFERENCIA ACME MENSAL"
+    transaction = make_transaction("500.00", descricao)
+    _memoria_de_match(session, company, payable, "APPROVED", descricao)
+
+    resultado, pool = matching.evaluate(session, transaction)
+    alvo = pool[0]
+    assert alvo.score == 85 and "amount" in alvo.reasons and alvo.effective == 95
+    assert alvo.effective >= matching.config.AUTO_MATCH_MIN > alvo.score
+    assert resultado.status == matching.REVIEW_REQUIRED
+
+
+def test_history_nunca_e_sinal_forte(session, company, make_payable, make_transaction):
+    assert not {"history", "history_rejected"} & matching.STRONG_SIGNALS
+    payable = make_payable("44120", "500.00")
+    descricao = "TRANSFERENCIA ACME MENSAL"
+    transaction = make_transaction("700.00", descricao)
+    _memoria_de_match(session, company, payable, "APPROVED", descricao)
+    _, pool = matching.evaluate(session, transaction)
+    alvo = pool[0]
+    assert "history" in alvo.reasons and "party" in alvo.reasons
+    assert not alvo.strong
+
+
+def test_baixa_automatica_nao_lista_history_nas_razoes(session, company, make_payable,
+                                                       make_transaction):
+    payable = make_payable("44120", "7500.00")
+    descricao = "PAGAMENTO NF 44120"
+    transaction = make_transaction("7500.00", descricao)
+    _memoria_de_match(session, company, payable, "APPROVED", descricao)
+    resultado, group = matching.run(session, transaction)
+    assert resultado.status == matching.AUTO_MATCHED
+    assert not {"history", "history_rejected"} & set(resultado.reasons)
+    assert not {"history", "history_rejected"} & set(group.match_reasons["reasons"])
+
+
+def test_rejeicao_vence_aprovacao_na_mesma_parte(session, company, make_payable,
+                                                 make_transaction):
+    payable = make_payable("44120", "7500.00")
+    descricao = "PAGAMENTO ACME MENSAL"
+    transaction = make_transaction("7500.00", descricao)
+    _memoria_de_match(session, company, payable, "APPROVED", descricao)  # a mais antiga
+    _memoria_de_match(session, company, payable, "REJECTED", descricao)
+    _memoria_de_match(session, company, payable, "REJECTED", descricao)  # duplicada
+    _, pool = matching.evaluate(session, transaction)
+    alvo = next(c for c in pool if c.id == payable.id)
+    assert alvo.history == -matching.config.WEIGHTS["history"]
+
+
+def test_matching_sobrevive_a_falha_da_memoria(session, company, make_payable,
+                                               make_transaction, monkeypatch):
+    make_payable("44120", "7500.00")
+    transaction = make_transaction("7500.00", "PAGAMENTO NF 44120")
+    estado = {"chamou": False}
+
+    def explode(sess, *a, **k):
+        estado["chamou"] = True
+        sess.execute(text("select 1/0"))  # envenena a transacao de verdade
+
+    monkeypatch.setattr(memory, "retrieve", explode)
+    resultado, _ = matching.run(session, transaction)
+    assert estado["chamou"]
+    assert resultado.status == matching.AUTO_MATCHED
+    assert session.execute(select(1)).scalar() == 1
 
 
 def test_rejeicao_passada_rebaixa_candidato(session, company, make_payable, make_transaction):
@@ -543,13 +615,22 @@ def test_rejeicao_passada_rebaixa_candidato(session, company, make_payable, make
 
 
 def test_history_desempata_candidatos(session, company, make_payable, make_transaction):
-    primeiro = make_payable("44120", "7500.00")
-    make_payable("44121", "7500.00")
-    transaction = make_transaction("7500.00", "PAGAMENTO ACME MENSAL")
-    _memoria_de_match(session, company, primeiro, "APPROVED", "PAGAMENTO ACME MENSAL")
+    """Fornecedores diferentes: so a memoria separa dois titulos de base identica."""
+    outro = db.Supplier(name="OUTRO LTDA", cnpj="99888777000166")
+    session.add(outro)
+    session.commit()
+    session.add(db.Payable(supplier_id=outro.id, invoice_number="44121",
+                           amount_original=Decimal("7500.00"), amount_open=Decimal("7500.00"),
+                           due_date=TODAY))
+    session.commit()
+    aprovado = make_payable("44120", "7500.00")  # criado depois: sem memoria ficaria atras
+    descricao = "PAGAMENTO MENSAL"
+    transaction = make_transaction("7500.00", descricao)
+    _memoria_de_match(session, company, aprovado, "APPROVED", descricao)
 
-    _, pool = matching.evaluate(session, transaction)
-    assert pool[0].id == primeiro.id and pool[0].history > 0
+    resultado, pool = matching.evaluate(session, transaction)
+    assert pool[0].id == aprovado.id and pool[0].history > 0
+    assert pool[0].score == pool[1].score and pool[1].history == 0
 
 
 def test_matching_funciona_sem_nenhuma_memoria(session, make_payable, make_transaction):
