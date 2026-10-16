@@ -17,7 +17,6 @@ def test_memory_item_grava_tsvector_e_embedding(session, company):
         embedding=[0.1] * db.EMBEDDING_DIM,
         item_metadata={"invoice_number": "44120"},
         source_entity="document",
-        source_id=1,
     )
     session.add(item)
     session.commit()
