@@ -16,6 +16,8 @@ from app.db import MemoryItem, audit
 
 logger = logging.getLogger(__name__)
 
+logger = logging.getLogger(__name__)
+
 
 def _fake_vector(text: str) -> list[float]:
     """Embedding deterministico para rodar offline. Nao tem semantica: so reprodutibilidade."""
@@ -120,7 +122,10 @@ def retrieve(
     filters: dict | None = None,
     k: int = 5,
 ) -> list[Hit]:
-    """Busca hibrida: filtro estruturado -> full-text + vetor -> fusao RRF."""
+    """Busca hibrida: filtro estruturado -> full-text + vetor -> fusao RRF.
+
+    Pode gravar um audit MEMORY_DEGRADED (sem embedding); quem chama decide commit/rollback.
+    """
     filters = filters or {}
     desconhecidas = set(filters) - FILTER_COLUMNS
     if desconhecidas:
@@ -142,6 +147,7 @@ def retrieve(
 
     vector = embed_query(query)
     if vector is None:
+        logger.warning("memoria degradada para kind=%s: embedding indisponivel", kind)
         audit(session, "memory", kind, "MEMORY_DEGRADED", kind=kind, reason="embedding_indisponivel")
     else:
         params["vector"] = _as_vector_literal(vector)
@@ -154,6 +160,7 @@ def retrieve(
             ) AS rank
             FROM base
             WHERE embedding IS NOT NULL
+            ORDER BY rank
             LIMIT :n
         )"""
         if vector is not None
@@ -180,6 +187,7 @@ def retrieve(
             ) AS rank
             FROM base
             WHERE content_tsv @@ plainto_tsquery('portuguese', :query)
+            ORDER BY rank
             LIMIT :n
         ){semantic_cte}
         SELECT

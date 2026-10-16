@@ -5,7 +5,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select
 
-from app import db, memory
+from app import config, db, memory
 from app.config import EMBEDDING_DIM
 from app.db import MATCH_DECISION
 
@@ -133,15 +133,45 @@ def test_retrieve_ignora_filtro_none(session, company):
     assert len(hits) == 1, "filtro None nao deve restringir nada"
 
 
-def test_retrieve_acha_container_pelo_full_text(session):
-    """Canal lexico salva a busca: o embedding fake nao tem semantica nenhuma."""
+def _vetor(*componentes):
+    """Vetor de EMBEDDING_DIM posicoes com as primeiras componentes dadas."""
+    return list(componentes) + [0.0] * (EMBEDDING_DIM - len(componentes))
+
+
+def test_retrieve_acha_container_pelo_full_text(session, monkeypatch):
+    """O canal semantico (limitado a 2) so enxerga ruido; o lexico resgata o alvo."""
+    monkeypatch.setattr(config, "RETRIEVE_CANDIDATES", 2)
+    monkeypatch.setattr(
+        memory, "embed", lambda texts: [_vetor(0.0, 1.0) if "MSCU" in x else _vetor(1.0) for x in texts]
+    )
+    monkeypatch.setattr(memory, "embed_query", lambda text: _vetor(1.0))
     for indice in range(6):
         _lembrar(session, f"pagamento generico numero {indice} sem referencia forte")
     alvo = _lembrar(session, "documento com container MSCU1234567 do embarque")
 
     hits = memory.retrieve(session, db.EXTRACTION_EXAMPLE, "MSCU1234567", k=3)
-    assert hits[0].item.id == alvo.id
-    assert "lexical" in hits[0].via
+    por_id = {hit.item.id: hit for hit in hits}
+    assert alvo.id in por_id, "o lexico deve resgatar o alvo que o semantico descartou"
+    assert por_id[alvo.id].via == {"lexical"}
+
+
+def test_retrieve_funde_canais_por_rrf(session, monkeypatch):
+    monkeypatch.setattr(config, "RETRIEVE_CANDIDATES", 2)
+    vetores = {"ambos": _vetor(1.0), "lexico": _vetor(0.0, 1.0), "semantico": _vetor(0.9, 0.1)}
+    monkeypatch.setattr(
+        memory, "embed", lambda texts: [vetores[x.split()[0]] for x in texts]
+    )
+    monkeypatch.setattr(memory, "embed_query", lambda text: _vetor(1.0))
+    ambos = _lembrar(session, "ambos container MSCU1234567")
+    lexico = _lembrar(session, "lexico container MSCU1234567")
+    semantico = _lembrar(session, "semantico texto sem relacao")
+
+    hits = {h.item.id: h for h in memory.retrieve(session, db.EXTRACTION_EXAMPLE, "MSCU1234567")}
+    assert hits[ambos.id].via == {"lexical", "semantic"}
+    assert hits[lexico.id].via == {"lexical"}
+    assert hits[semantico.id].via == {"semantic"}
+    assert hits[ambos.id].score > hits[lexico.id].score
+    assert hits[ambos.id].score > hits[semantico.id].score
 
 
 def test_retrieve_respeita_k(session):
