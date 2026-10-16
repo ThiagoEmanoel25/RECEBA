@@ -246,7 +246,6 @@ def test_extract_com_llm_injeta_exemplo_do_mesmo_cnpj(session, monkeypatch):
     assert memory_ids == [item.id]
     assert documento.invoice_number == "44121"
     enviado = capturado["messages"][0]["content"]
-    print("PROMPT_CAPTURADO>>>" + enviado + "<<<")
     assert "44120" in enviado, "o exemplo corrigido deve entrar no prompt"
     assert "EXEMPLOS" in enviado
 
