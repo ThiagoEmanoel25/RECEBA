@@ -6,7 +6,8 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
-from app import db
+from app import db, memory
+from app.db import MATCH_DECISION
 from app.main import app
 from tests.conftest import TODAY
 
@@ -269,3 +270,62 @@ def test_patch_extracted_banco_mantem_formato_aninhado(client, session):
     memoria = session.get(db.MemoryItem, response.json()["memory_id"])
     assert memoria.item_metadata["bank_account"] == extracted["bank_account"]
     assert "bank_code" not in extracted and "bank_agency" not in extracted
+
+
+DESC_MATCH = "PAGAMENTO ACME NF 44120 DIVERGENTE"
+
+
+def _gera_grupo(client, make_payable, make_transaction):
+    payable = make_payable("44120", "7500.00")
+    transaction = make_transaction("7500.00", DESC_MATCH)
+    # auto_settle=false deixa o grupo aberto para decisao humana
+    run = client.post(f"/matching/{transaction.id}/run?auto_settle=false",
+                      headers=HEADERS).json()
+    return payable, transaction, run
+
+
+def test_aprovacao_de_match_grava_memoria_episodica(client, session, company, make_payable,
+                                                    make_transaction):
+    payable, transaction, run = _gera_grupo(client, make_payable, make_transaction)
+    assert run["group_id"], run
+
+    resposta = client.post(f"/matching/{transaction.id}/approve", headers=HEADERS)
+    assert resposta.status_code == 200, resposta.text
+
+    hits = memory.retrieve(session, MATCH_DECISION, DESC_MATCH)
+    assert hits, "aprovacao humana deve virar memoria"
+    item = hits[0].item
+    assert item.item_metadata == {
+        "decision": "APPROVED",
+        "entity_type": "PAYABLE",
+        "entity_id": payable.id,
+        "group_type": item.item_metadata["group_type"],
+        "amount": "7500.00",
+        "reason": None,
+        "actor": "dev-***",  # Actor.key ja vem mascarado
+    }
+    assert item.supplier_id == company["supplier"].id
+    assert item.customer_id is None
+    assert item.bank_account_id == company["account"].id
+    assert item.amount == Decimal("7500.00")
+
+
+def test_rejeicao_de_match_grava_memoria_negativa(client, session, company, make_payable,
+                                                  make_transaction):
+    payable, transaction, run = _gera_grupo(client, make_payable, make_transaction)
+    assert run["group_id"], run
+
+    resposta = client.post(
+        f"/matching/{transaction.id}/reject",
+        headers=HEADERS,
+        params={"reason": "fornecedor errado"},
+    )
+    assert resposta.status_code == 200, resposta.text
+
+    hits = memory.retrieve(session, MATCH_DECISION, DESC_MATCH)
+    assert hits
+    item = hits[0].item
+    assert item.item_metadata["decision"] == "REJECTED"
+    assert item.item_metadata["reason"] == "fornecedor errado"
+    assert item.item_metadata["entity_id"] == payable.id
+    assert item.supplier_id == company["supplier"].id

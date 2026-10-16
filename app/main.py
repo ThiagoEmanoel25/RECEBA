@@ -20,6 +20,7 @@ from app.db import (
     EXTRACTION_EXAMPLE,
     Document,
     ExtractedDocument,
+    MATCH_DECISION,
     MatchingCandidate,
     Payable,
     Receivable,
@@ -508,6 +509,7 @@ def reject_matching(
     group.status = "REJECTED"
     transaction = session.get(BankTransaction, transaction_id)
     transaction.status = matching.UNMATCHED
+    _remember_match(session, group, "REJECTED", actor=actor, reason=reason)
     audit(session, "reconciliation_group", group.id, "HUMAN_REJECTED",
           actor_type="USER", actor_id=actor.key, reason=reason)
     session.commit()
@@ -528,6 +530,57 @@ def _recalc(session: Session, group: ReconciliationGroup) -> None:
     )
     group.total_allocated_amount = allocated
     group.difference = Decimal(group.total_transaction_amount) - allocated
+
+
+def _remember_match(
+    session: Session,
+    group: ReconciliationGroup,
+    decision: str,
+    *,
+    actor: Actor,
+    reason: str | None = None,
+):
+    """Decisao humana de match vira memoria episodica, com a parte envolvida como chave."""
+    transaction = session.get(BankTransaction, group.bank_transaction_id)
+    item = session.scalar(
+        select(ReconciliationGroupItem).where(
+            ReconciliationGroupItem.reconciliation_group_id == group.id,
+            ReconciliationGroupItem.entity_type.in_(("PAYABLE", "RECEIVABLE")),
+        ).order_by(ReconciliationGroupItem.id)
+    )
+    if transaction is None or item is None:
+        return None
+
+    # a parte (fornecedor/cliente) e a chave que a pontuacao usa depois: o titulo ja baixado
+    # nunca volta como candidato aberto.
+    supplier_id = customer_id = None
+    if item.entity_type == "PAYABLE":
+        title = session.get(Payable, item.entity_id)
+        supplier_id = title.supplier_id if title else None
+    else:
+        title = session.get(Receivable, item.entity_id)
+        customer_id = title.customer_id if title else None
+
+    return memory.remember(
+        session,
+        MATCH_DECISION,
+        transaction.description_normalized or transaction.description_raw or "",
+        item_metadata={
+            "decision": decision,
+            "entity_type": item.entity_type,
+            "entity_id": item.entity_id,
+            "group_type": group.group_type,
+            "amount": str(transaction.amount),
+            "reason": reason,
+            "actor": actor.key,
+        },
+        source_entity="reconciliation_group",
+        source_id=group.id,
+        supplier_id=supplier_id,
+        customer_id=customer_id,
+        bank_account_id=transaction.bank_account_id,
+        amount=Decimal(transaction.amount),
+    )
 
 
 @app.get("/reconciliation-groups/{group_id}")
@@ -645,6 +698,7 @@ def _approve_group(session: Session, group: ReconciliationGroup, actor: Actor) -
     group.status = "APPROVED"
     transaction = session.get(BankTransaction, group.bank_transaction_id)
     transaction.status = "RECONCILED"
+    _remember_match(session, group, "APPROVED", actor=actor)
     audit(session, "reconciliation_group", group.id, "HUMAN_APPROVED",
           actor_type="USER", actor_id=actor.key)
     session.commit()
