@@ -4,12 +4,15 @@ from __future__ import annotations
 import datetime as dt
 from decimal import Decimal
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     JSON,
     Boolean,
+    Computed,
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Numeric,
     String,
     Text,
@@ -17,9 +20,10 @@ from sqlalchemy import (
     create_engine,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-from app.config import DATABASE_URL
+from app.config import DATABASE_URL, EMBEDDING_DIM
 
 Money = Numeric(18, 2)
 
@@ -178,6 +182,7 @@ class BankTransaction(Base, TimestampMixin):
     currency: Mapped[str] = mapped_column(String(3), default="BRL")
     status: Mapped[str] = mapped_column(String(25), default="IMPORTED")
     raw_payload: Mapped[dict | None] = mapped_column(JSON)
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM))
 
 
 class BankBalance(Base):
@@ -266,6 +271,44 @@ class AuditEvent(Base, TimestampMixin):
     actor_type: Mapped[str] = mapped_column(String(20), default="SYSTEM")
     actor_id: Mapped[str | None] = mapped_column(String(80))
     event_metadata: Mapped[dict | None] = mapped_column(JSON)
+
+
+# Tipos de memoria (Spec 1). Procedural: como extrair. Episodica: o que ja foi decidido.
+EXTRACTION_EXAMPLE = "EXTRACTION_EXAMPLE"
+MATCH_DECISION = "MATCH_DECISION"
+DIVERGENCE_CASE = "DIVERGENCE_CASE"
+
+
+class MemoryItem(Base, TimestampMixin):
+    """Memoria vinda de decisao humana. Busca hibrida: estruturada + full-text + vetor."""
+
+    __tablename__ = "memory_items"
+    __table_args__ = (
+        Index("ix_memory_items_tsv", "content_tsv", postgresql_using="gin"),
+        Index(
+            "ix_memory_items_embedding",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(30), index=True)
+    supplier_id: Mapped[int | None] = mapped_column(ForeignKey("suppliers.id"), index=True)
+    customer_id: Mapped[int | None] = mapped_column(ForeignKey("customers.id"), index=True)
+    bank_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bank_accounts.id"), index=True
+    )
+    cnpj: Mapped[str | None] = mapped_column(String(14), index=True)
+    amount: Mapped[Decimal | None] = mapped_column(Money)
+    content: Mapped[str] = mapped_column(Text)
+    content_tsv: Mapped[str | None] = mapped_column(
+        TSVECTOR, Computed("to_tsvector('portuguese', content)", persisted=True)
+    )
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM))
+    item_metadata: Mapped[dict | None] = mapped_column(JSONB)
+    source_entity: Mapped[str | None] = mapped_column(String(40))
+    source_id: Mapped[int | None] = mapped_column()
 
 
 def audit(
