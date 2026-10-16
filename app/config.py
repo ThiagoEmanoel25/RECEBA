@@ -27,7 +27,7 @@ FEE_MAX = Decimal(os.getenv("FEE_MAX", "150.00"))  # tarifa/juros/multa aceita s
 WEIGHTS: dict[str, int] = json.loads(
     os.getenv(
         "MATCH_WEIGHTS",
-        '{"invoice":40,"cnpj":25,"amount":20,"party":10,"date":5,"bl":15,"container":15}',
+        '{"invoice":40,"cnpj":25,"amount":20,"party":10,"date":5,"bl":15,"container":15,"history":10}',
     )
 )
 AUTO_MATCH_MIN = int(os.getenv("AUTO_MATCH_MIN", 90))

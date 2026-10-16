@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from dataclasses import dataclass, field
 from decimal import Decimal
 from itertools import combinations
@@ -9,10 +10,11 @@ from itertools import combinations
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import config
+from app import config, memory
 from app.db import (
     BankTransaction,
     Customer,
+    MATCH_DECISION,
     MatchingCandidate,
     Payable,
     Receivable,
@@ -33,13 +35,16 @@ UNMATCHED = "UNMATCHED"
 # Referencias de peso alto: so elas liberam baixa parcial/ajuste automatico.
 STRONG_SIGNALS = {"invoice", "bl", "container"}
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(slots=True)
 class Scored:
     entity_type: str
     entity: object
-    score: int
+    score: int  # score base: so sinais do documento. O teto da memoria mora aqui.
     reasons: list[str] = field(default_factory=list)
+    history: int = 0  # ajuste vindo da memoria; nunca entra no score base
 
     @property
     def id(self) -> int:
@@ -52,6 +57,11 @@ class Scored:
     @property
     def strong(self) -> bool:
         return any(r in STRONG_SIGNALS for r in self.reasons)
+
+    @property
+    def effective(self) -> int:
+        """Score com a memoria. Usado para ordenar, desempatar e promover revisao."""
+        return min(100, max(0, self.score + self.history))
 
 
 def _party(session: Session, scored_entity) -> Supplier | Customer | None:
@@ -100,6 +110,63 @@ def score(
     return total, reasons
 
 
+def apply_history(session: Session, transaction: BankTransaction, pool: list[Scored]) -> None:
+    """Aplica memoria episodica ao pool. Muta no lugar; nunca mexe no score base.
+
+    A memoria e consultiva: so reordena e promove revisao. Falha dela nao derruba o matching.
+    """
+    weight = config.WEIGHTS.get("history", 0)
+    if not pool or not weight:
+        return
+    query = transaction.description_normalized or transaction.description_raw or ""
+    if not query:
+        return
+
+    try:
+        with session.begin_nested():  # savepoint: erro de banco nao suja a transacao externa
+            hits = memory.retrieve(
+                session,
+                MATCH_DECISION,
+                query,
+                filters={"bank_account_id": transaction.bank_account_id},
+                k=config.HISTORY_HITS,
+            )
+    except Exception:  # noqa: BLE001 - memoria e consultiva, nunca bloqueia o matching
+        logger.warning("falha ao buscar memoria de match; seguindo sem history", exc_info=True)
+        return
+
+    # A memoria vale pela parte envolvida, nao pelo titulo: titulo pago nao reaparece.
+    # Uma decisao por parte (setdefault): rejeicao repetida grava memoria duplicada e o
+    # lote aprovado grava varias memorias com o mesmo texto; nada disso pode acumular peso.
+    # So conta hit lexical: o canal semantico devolve vizinhos mesmo sem relacao real.
+    by_party: dict[tuple[str, int], str] = {}
+    for hit in hits:
+        if "lexical" not in hit.via:
+            continue
+        decision = (hit.item.item_metadata or {}).get("decision")
+        if decision not in {"APPROVED", "REJECTED"}:
+            continue
+        for column, value in (("supplier", hit.item.supplier_id),
+                              ("customer", hit.item.customer_id)):
+            if value is not None:
+                by_party.setdefault((column, value), decision)
+    if not by_party:
+        return
+
+    for candidate in pool:
+        party = _party(session, candidate.entity)
+        if party is None:
+            continue
+        key = ("supplier" if isinstance(candidate.entity, Payable) else "customer", party.id)
+        decision = by_party.get(key)
+        if decision == "APPROVED":
+            candidate.history = weight
+            candidate.reasons.append("history")
+        elif decision == "REJECTED":
+            candidate.history = -weight
+            candidate.reasons.append("history_rejected")
+
+
 def candidates(session: Session, transaction: BankTransaction) -> list[Scored]:
     """Filtra por conta/moeda/janela de datas antes de pontuar (spec secao 22)."""
     tokens = parse_observation(transaction.description_raw or transaction.description_normalized)
@@ -125,7 +192,8 @@ def candidates(session: Session, transaction: BankTransaction) -> list[Scored]:
         value, reasons = score(transaction, row, _party(session, row), tokens)
         if value > 0:
             scored.append(Scored(entity_type, row, value, reasons))
-    scored.sort(key=lambda s: (-s.score, s.amount_open))
+    apply_history(session, transaction, scored)
+    scored.sort(key=lambda s: (-s.effective, s.amount_open))
     return scored
 
 
@@ -164,7 +232,9 @@ def evaluate(session: Session, transaction: BankTransaction) -> tuple[MatchResul
         return MatchResult(UNMATCHED, reasons=["sem candidatos"]), pool
 
     best = pool[0]
-    tied = [c for c in pool if c.score == best.score]
+    # Auto-match olha so o score base: a memoria nao escolhe nem desempata baixa automatica.
+    base_best = min(pool, key=lambda c: (-c.score, c.amount_open))
+    tied = [c for c in pool if c.score == base_best.score]
 
     # 1) Exact Match: referencia forte unica + valor exato (spec secoes 15 e 16).
     exact = [c for c in pool if c.strong and "amount" in c.reasons]
@@ -177,22 +247,22 @@ def evaluate(session: Session, transaction: BankTransaction) -> tuple[MatchResul
         )
     if len(exact) > 1:
         return (
-            MatchResult(REVIEW_REQUIRED, confidence=best.score,
+            MatchResult(REVIEW_REQUIRED, confidence=best.effective,
                         reasons=[f"{len(exact)} titulos com referencia e valor identicos"]),
             pool,
         )
 
-    # 2) score alto com valor batendo
-    if best.score >= config.AUTO_MATCH_MIN and "amount" in best.reasons:
+    # 2) score alto com valor batendo. Teto da memoria: score base, sem history.
+    if base_best.score >= config.AUTO_MATCH_MIN and "amount" in base_best.reasons:
         if len(tied) > 1:
             return (
                 MatchResult(REVIEW_REQUIRED, reasons=["empate entre candidatos de mesmo score"],
-                            confidence=best.score),
+                            confidence=best.effective),
                 pool,
             )
         return (
-            MatchResult(AUTO_MATCHED, "SINGLE", [(best.entity_type, best.id, amount)],
-                        best.score, best.reasons),
+            MatchResult(AUTO_MATCHED, "SINGLE", [(base_best.entity_type, base_best.id, amount)],
+                        base_best.score, base_best.reasons),
             pool,
         )
 
@@ -237,7 +307,7 @@ def evaluate(session: Session, transaction: BankTransaction) -> tuple[MatchResul
             MatchResult(
                 MATCHED_BATCH, group_type,
                 [(item.entity_type, item.id, item.amount_open) for item in group],
-                min(item.score for item in group),
+                min(item.effective for item in group),
                 sorted({r for item in group for r in item.reasons}),
             ),
             pool,
@@ -245,14 +315,15 @@ def evaluate(session: Session, transaction: BankTransaction) -> tuple[MatchResul
     if len(batches) > 1:
         return (
             MatchResult(REVIEW_REQUIRED, reasons=[f"{len(batches)} combinacoes de lote validas"],
-                        confidence=best.score),
+                        confidence=best.effective),
             pool,
         )
 
     # 5) revisao humana
-    if best.score >= config.REVIEW_MIN:
-        return MatchResult(REVIEW_REQUIRED, confidence=best.score, reasons=best.reasons), pool
-    return MatchResult(UNMATCHED, confidence=best.score, reasons=best.reasons), pool
+    # History pode promover UNMATCHED -> REVIEW_REQUIRED, nunca liberar baixa.
+    if best.effective >= config.REVIEW_MIN:
+        return MatchResult(REVIEW_REQUIRED, confidence=best.effective, reasons=best.reasons), pool
+    return MatchResult(UNMATCHED, confidence=best.effective, reasons=best.reasons), pool
 
 
 def _settle(session: Session, result: MatchResult) -> None:

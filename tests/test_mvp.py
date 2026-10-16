@@ -7,7 +7,15 @@ from sqlalchemy import select, text
 from app import db, extract, matching, memory
 from app.bank_import import import_csv, set_balance
 from app.config import EMBEDDING_DIM
-from app.db import EXTRACTION_EXAMPLE, Document, ExtractedDocument, Payable, PurchaseOrder, Receivable
+from app.db import (
+    EXTRACTION_EXAMPLE,
+    MATCH_DECISION,
+    Document,
+    ExtractedDocument,
+    Payable,
+    PurchaseOrder,
+    Receivable,
+)
 from app.reconcile import run_daily
 from app.validation import ValidationEngine
 from tests.conftest import TODAY
@@ -478,3 +486,76 @@ def test_reimportacao_identica_nao_chama_embed(session, company, monkeypatch):
     assert resultado["duplicated"] == 2
     assert resultado["embedded"] == 0
     assert chamadas == []
+
+
+def _memoria_de_match(session, company, payable, decision, descricao):
+    memory.remember(
+        session,
+        MATCH_DECISION,
+        descricao,
+        item_metadata={
+            "decision": decision,
+            "entity_type": "PAYABLE",
+            "entity_id": payable.id,
+        },
+        supplier_id=company["supplier"].id,
+        bank_account_id=company["account"].id,
+    )
+    session.commit()
+
+
+def test_history_sozinho_nao_gera_auto_match(session, company, make_payable, make_transaction):
+    """Teto da memoria: sem sinal forte proprio, history nao libera baixa automatica."""
+    payable = make_payable("44120", "7500.00")
+    transaction = make_transaction("9999.00", "TRANSFERENCIA ACME SEM REFERENCIA")
+    _memoria_de_match(session, company, payable, "APPROVED",
+                      "TRANSFERENCIA ACME SEM REFERENCIA")
+
+    resultado, pool = matching.evaluate(session, transaction)
+    assert resultado.status != matching.AUTO_MATCHED
+    assert any(c.history > 0 for c in pool), "history deve ter sido aplicado"
+
+
+def test_history_promove_unmatched_para_revisao(session, company, make_payable,
+                                                make_transaction):
+    payable = make_payable("44120", "500.00")
+    transaction = make_transaction("777.00", "TRANSFERENCIA ACME MENSAL")
+    sem_memoria, _ = matching.evaluate(session, transaction)
+
+    _memoria_de_match(session, company, payable, "APPROVED", "TRANSFERENCIA ACME MENSAL")
+    com_memoria, pool = matching.evaluate(session, transaction)
+
+    assert sem_memoria.confidence < com_memoria.confidence
+    if sem_memoria.status == matching.UNMATCHED:
+        assert com_memoria.status in {matching.UNMATCHED, matching.REVIEW_REQUIRED}
+
+
+def test_rejeicao_passada_rebaixa_candidato(session, company, make_payable, make_transaction):
+    payable = make_payable("44120", "7500.00")
+    transaction = make_transaction("7500.00", "PAGAMENTO ACME MENSAL")
+    _memoria_de_match(session, company, payable, "REJECTED", "PAGAMENTO ACME MENSAL")
+
+    _, pool = matching.evaluate(session, transaction)
+    alvo = next(c for c in pool if c.id == payable.id)
+    assert alvo.history < 0
+    assert "history_rejected" in alvo.reasons
+    assert alvo.effective < alvo.score
+
+
+def test_history_desempata_candidatos(session, company, make_payable, make_transaction):
+    primeiro = make_payable("44120", "7500.00")
+    make_payable("44121", "7500.00")
+    transaction = make_transaction("7500.00", "PAGAMENTO ACME MENSAL")
+    _memoria_de_match(session, company, primeiro, "APPROVED", "PAGAMENTO ACME MENSAL")
+
+    _, pool = matching.evaluate(session, transaction)
+    assert pool[0].id == primeiro.id and pool[0].history > 0
+
+
+def test_matching_funciona_sem_nenhuma_memoria(session, make_payable, make_transaction):
+    """Regressao: pipeline inteiro continua igual quando a memoria esta vazia."""
+    make_payable("44120", "7500.00")
+    transaction = make_transaction("7500.00", "PAGAMENTO NF 44120")
+    resultado, pool = matching.evaluate(session, transaction)
+    assert resultado.status == matching.AUTO_MATCHED
+    assert all(c.history == 0 for c in pool)
