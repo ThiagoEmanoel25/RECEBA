@@ -299,7 +299,8 @@ def evaluate(session: Session, transaction: BankTransaction) -> tuple[MatchResul
             )
 
     # 4) lote
-    batches = find_batches(amount, pool)
+    # Lote baixa sozinho: o corte por BATCH_MAX_CANDIDATES segue a ordem do score base.
+    batches = find_batches(amount, sorted(pool, key=lambda c: (-c.score, c.amount_open)))
     if len(batches) == 1:
         group = batches[0]
         group_type = "BATCH_PAYMENT" if transaction.direction == "DEBIT" else "BATCH_RECEIPT"
