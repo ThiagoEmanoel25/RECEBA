@@ -221,6 +221,9 @@ class ExtractionCorrectionIn(BaseModel):
     observation: str | None = None
 
 
+BANK_FLAT_TO_NESTED = {"bank_code": "bank_code", "bank_agency": "agency", "bank_account": "account"}
+
+
 @app.patch("/documents/{document_id}/extracted")
 def correct_extraction(
     document_id: int,
@@ -248,7 +251,16 @@ def correct_extraction(
     before = extracted.structured_payload or {}
     for field_name, value in corrections.items():
         setattr(extracted, field_name, value)
-    extracted.structured_payload = {**before, **jsonable_encoder(corrections)}
+    # No JSON o banco vai aninhado (bank_account.{bank_code,agency,account}); colunas ficam planas.
+    flat = jsonable_encoder(corrections)
+    bank = dict(before.get("bank_account") or {})
+    for flat_key, nested_key in BANK_FLAT_TO_NESTED.items():
+        if flat_key in flat:
+            bank[nested_key] = flat.pop(flat_key)
+    merged = {**before, **flat}
+    if bank:
+        merged["bank_account"] = bank
+    extracted.structured_payload = merged
     extracted.model_name = f"{extracted.model_name or 'desconhecido'}+humano"
 
     cnpj = digits(extracted.supplier_cnpj)
@@ -268,6 +280,7 @@ def correct_extraction(
     )
 
     # Campos mudaram: a validacao anterior nao vale mais, exige revalidar.
+    # ponytail: correcao nao reverte Payable ja criado; estorno exige processo proprio.
     document.status = "EXTRACTED"
     audit(
         session,

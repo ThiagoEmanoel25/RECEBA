@@ -150,7 +150,7 @@ def test_aprovacao_exige_perfil_aprovador(client):
     assert response["status"] == "UNMATCHED"
 
 
-def test_patch_extracted_corrige_campos_e_grava_memoria(client):
+def test_patch_extracted_corrige_campos_e_grava_memoria(client, session):
     upload = client.post(
         "/documents",
         headers=HEADERS,
@@ -177,6 +177,9 @@ def test_patch_extracted_corrige_campos_e_grava_memoria(client):
     auditoria = client.get(f"/audit/document/{document_id}", headers=HEADERS).json()
     corrigido = [e for e in auditoria if e["event"] == "EXTRACTION_CORRECTED"]
     assert len(corrigido) == 1
+    memoria = session.get(db.MemoryItem, body["memory_id"])
+    assert memoria.kind == db.EXTRACTION_EXAMPLE
+    assert memoria.cnpj == "11222333000181"
     assert corrigido[0]["metadata"]["memory_id"] == body["memory_id"]
     assert sorted(corrigido[0]["metadata"]["fields"]) == ["amount", "invoice_number"]
 
@@ -207,3 +210,62 @@ def test_patch_extracted_nega_viewer(client):
         f"/documents/{document_id}/extracted", headers=VIEWER, json={"invoice_number": "x"}
     )
     assert response.status_code == 403
+
+
+def _processado(client):
+    upload = client.post(
+        "/documents",
+        headers=HEADERS,
+        files={"file": ("nota.txt", NOTA.encode(), "text/csv")},
+    )
+    document_id = upload.json()["id"]
+    client.post(f"/documents/{document_id}/process", headers=HEADERS)
+    return document_id
+
+
+def test_patch_extracted_parcial_preserva_campos_omitidos(client, session):
+    document_id = _processado(client)
+    response = client.patch(
+        f"/documents/{document_id}/extracted", headers=HEADERS, json={"amount": "7600.00"}
+    )
+    assert response.status_code == 200
+    linha = session.query(db.ExtractedDocument).filter_by(document_id=document_id).one()
+    session.refresh(linha)
+    assert linha.invoice_number == "44120"
+    assert linha.amount == Decimal("7600.00")
+    detalhe = client.get(f"/documents/{document_id}", headers=HEADERS).json()
+    assert detalhe["extracted"]["invoice_number"] == "44120"
+    assert linha.structured_payload["invoice_number"] == "44120"
+
+
+def test_patch_extracted_corpo_vazio_ou_nulo_422(client):
+    document_id = _processado(client)
+    for corpo in ({}, {"amount": None}):
+        response = client.patch(
+            f"/documents/{document_id}/extracted", headers=HEADERS, json=corpo
+        )
+        assert response.status_code == 422
+
+
+def test_patch_extracted_banco_mantem_formato_aninhado(client, session):
+    document_id = _processado(client)
+    # O extrator deterministico nao preenche banco; semeia o formato aninhado do LLM.
+    linha = session.query(db.ExtractedDocument).filter_by(document_id=document_id).one()
+    linha.structured_payload = {
+        **linha.structured_payload,
+        "bank_account": {"bank_code": "341", "agency": "4321", "account": "98765"},
+    }
+    session.commit()
+    antes = client.get(f"/documents/{document_id}", headers=HEADERS).json()["extracted"]
+    assert isinstance(antes["bank_account"], dict)
+    response = client.patch(
+        f"/documents/{document_id}/extracted", headers=HEADERS, json={"bank_account": "12345-6"}
+    )
+    assert response.status_code == 200
+    extracted = client.get(f"/documents/{document_id}", headers=HEADERS).json()["extracted"]
+    assert extracted["bank_account"]["account"] == "12345-6"
+    assert extracted["bank_account"]["bank_code"] == antes["bank_account"]["bank_code"]
+    assert extracted["bank_account"]["agency"] == antes["bank_account"]["agency"]
+    memoria = session.get(db.MemoryItem, response.json()["memory_id"])
+    assert memoria.item_metadata["bank_account"] == extracted["bank_account"]
+    assert "bank_code" not in extracted and "bank_agency" not in extracted
