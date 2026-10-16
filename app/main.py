@@ -8,15 +8,16 @@ from decimal import Decimal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, UploadFile
 from fastapi import File as FileParam
-from fastapi.encoders import ENCODERS_BY_TYPE
+from fastapi.encoders import ENCODERS_BY_TYPE, jsonable_encoder
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app import bank_import, matching, reconcile
+from app import bank_import, matching, memory, reconcile
 from app.config import ALLOWED_MIME, API_KEYS, MAX_UPLOAD_BYTES, STORAGE_DIR
 from app.db import (
     BankTransaction,
+    EXTRACTION_EXAMPLE,
     Document,
     ExtractedDocument,
     MatchingCandidate,
@@ -24,11 +25,13 @@ from app.db import (
     Receivable,
     ReconciliationGroup,
     ReconciliationGroupItem,
+    Supplier,
     audit,
     get_session,
     init_db,
 )
 from app.extract import extract_with_llm, read_text
+from app.parser import digits
 from app.validation import ValidationEngine, promote_to_payable
 
 # Dinheiro sai como string no JSON: float em API financeira perde centavo.
@@ -198,6 +201,92 @@ def process_document(
     audit(session, "document", document_id, "DOCUMENT_EXTRACTED", model=model_name)
     session.commit()
     return {"id": document_id, "status": document.status, "extracted": extracted.structured_payload}
+
+
+class ExtractionCorrectionIn(BaseModel):
+    """Correcao humana dos campos extraidos. Tudo opcional: so o enviado e corrigido."""
+
+    supplier_name: str | None = None
+    supplier_cnpj: str | None = None
+    invoice_number: str | None = None
+    amount: Decimal | None = None
+    due_date: dt.date | None = None
+    bank_code: str | None = None
+    bank_agency: str | None = None
+    bank_account: str | None = None
+    purchase_order: str | None = None
+    bill_of_lading: str | None = None
+    container: str | None = None
+    cost_center: str | None = None
+    observation: str | None = None
+
+
+@app.patch("/documents/{document_id}/extracted")
+def correct_extraction(
+    document_id: int,
+    payload: ExtractionCorrectionIn,
+    session: Session = Depends(get_session),
+    actor: Actor = Depends(WRITE),
+):
+    """Corrige a extracao e guarda o par (texto -> campos corretos) como memoria."""
+    document = session.get(Document, document_id)
+    if document is None:
+        raise HTTPException(404, "Documento inexistente")
+    extracted = session.scalar(
+        select(ExtractedDocument).where(ExtractedDocument.document_id == document_id)
+    )
+    if extracted is None:
+        raise HTTPException(409, "Documento ainda nao processado")
+
+    # Apenas o que o analista enviou: campo omitido nao sobrescreve valor bom com None.
+    corrections = payload.model_dump(exclude_unset=True, exclude_none=True)
+    if not corrections:
+        raise HTTPException(422, "Nenhum campo informado")
+    if "supplier_cnpj" in corrections:
+        corrections["supplier_cnpj"] = digits(corrections["supplier_cnpj"])
+
+    before = extracted.structured_payload or {}
+    for field_name, value in corrections.items():
+        setattr(extracted, field_name, value)
+    extracted.structured_payload = {**before, **jsonable_encoder(corrections)}
+    extracted.model_name = f"{extracted.model_name or 'desconhecido'}+humano"
+
+    cnpj = digits(extracted.supplier_cnpj)
+    supplier = session.scalar(select(Supplier).where(Supplier.cnpj == cnpj)) if cnpj else None
+
+    text = read_text(os.path.join(STORAGE_DIR, document.storage_key))
+    item = memory.remember(
+        session,
+        EXTRACTION_EXAMPLE,
+        text[:4000],
+        item_metadata=extracted.structured_payload,
+        source_entity="document",
+        source_id=document_id,
+        supplier_id=supplier.id if supplier else None,
+        cnpj=cnpj or None,
+        amount=extracted.amount,
+    )
+
+    # Campos mudaram: a validacao anterior nao vale mais, exige revalidar.
+    document.status = "EXTRACTED"
+    audit(
+        session,
+        "document",
+        document_id,
+        "EXTRACTION_CORRECTED",
+        actor_type="USER",
+        actor_id=actor.key,
+        fields=sorted(corrections),
+        memory_id=item.id,
+        previous_payload=before,
+    )
+    session.commit()
+    return {
+        "id": document_id,
+        "status": document.status,
+        "corrected_fields": sorted(corrections),
+        "memory_id": item.id,
+    }
 
 
 @app.post("/documents/{document_id}/validate")

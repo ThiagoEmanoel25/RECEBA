@@ -148,3 +148,62 @@ def test_aprovacao_exige_perfil_aprovador(client):
     ).json()
     response = client.post(f"/matching/{imported['ids'][0]}/run", headers=HEADERS).json()
     assert response["status"] == "UNMATCHED"
+
+
+def test_patch_extracted_corrige_campos_e_grava_memoria(client):
+    upload = client.post(
+        "/documents",
+        headers=HEADERS,
+        files={"file": ("nota.txt", NOTA.encode(), "text/csv")},
+    )
+    document_id = upload.json()["id"]
+    client.post(f"/documents/{document_id}/process", headers=HEADERS)
+
+    response = client.patch(
+        f"/documents/{document_id}/extracted",
+        headers=HEADERS,
+        json={"invoice_number": "44121", "amount": "7600.00"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "EXTRACTED"
+    assert sorted(body["corrected_fields"]) == ["amount", "invoice_number"]
+    assert body["memory_id"] is not None
+
+    detalhe = client.get(f"/documents/{document_id}", headers=HEADERS).json()
+    assert detalhe["extracted"]["invoice_number"] == "44121"
+    assert detalhe["extracted"]["amount"] == "7600.00"
+
+    auditoria = client.get(f"/audit/document/{document_id}", headers=HEADERS).json()
+    corrigido = [e for e in auditoria if e["event"] == "EXTRACTION_CORRECTED"]
+    assert len(corrigido) == 1
+    assert corrigido[0]["metadata"]["memory_id"] == body["memory_id"]
+    assert sorted(corrigido[0]["metadata"]["fields"]) == ["amount", "invoice_number"]
+
+
+def test_patch_extracted_exige_documento_processado(client):
+    upload = client.post(
+        "/documents",
+        headers=HEADERS,
+        files={"file": ("nota.txt", NOTA.encode(), "text/csv")},
+    )
+    response = client.patch(
+        f"/documents/{upload.json()['id']}/extracted",
+        headers=HEADERS,
+        json={"invoice_number": "44121"},
+    )
+    assert response.status_code == 409
+
+
+def test_patch_extracted_nega_viewer(client):
+    upload = client.post(
+        "/documents",
+        headers=HEADERS,
+        files={"file": ("nota.txt", NOTA.encode(), "text/csv")},
+    )
+    document_id = upload.json()["id"]
+    client.post(f"/documents/{document_id}/process", headers=HEADERS)
+    response = client.patch(
+        f"/documents/{document_id}/extracted", headers=VIEWER, json={"invoice_number": "x"}
+    )
+    assert response.status_code == 403
