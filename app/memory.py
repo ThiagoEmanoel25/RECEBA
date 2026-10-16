@@ -7,7 +7,12 @@ import logging
 import math
 import os
 from dataclasses import dataclass, field
+from typing import Any
 
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
+from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.tools import BaseTool
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
@@ -221,3 +226,53 @@ def retrieve(
             via.add("semantic")
         hits.append(Hit(item=items[row.id], score=float(row.score), via=via))
     return hits
+
+
+class RecebaRetriever(BaseRetriever):
+    """Ponte para a Spec 2: o agente LangGraph consome retrieve() por aqui."""
+
+    session: Any
+    kind: str
+    filters: dict | None = None
+    k: int = 5
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun
+    ) -> list[Document]:
+        hits = retrieve(
+            self.session, self.kind, query, filters=self.filters, k=self.k
+        )
+        return [
+            Document(
+                page_content=hit.item.content,
+                metadata={
+                    **(hit.item.item_metadata or {}),
+                    "memory_id": hit.item.id,
+                    "kind": hit.item.kind,
+                    "score": hit.score,
+                    "via": sorted(hit.via),
+                    "source": f"{hit.item.source_entity}:{hit.item.source_id}",
+                },
+            )
+            for hit in hits
+        ]
+
+
+def retriever_tool(
+    session: Session,
+    kind: str,
+    *,
+    filters: dict | None = None,
+    k: int = 5,
+    name: str | None = None,
+    description: str | None = None,
+) -> BaseTool:
+    """Ferramenta pronta para o agente. Nome e descricao em portugues, como o dominio."""
+    retriever = RecebaRetriever(session=session, kind=kind, filters=filters, k=k)
+    return retriever.as_tool(
+        name=name or f"buscar_{kind.lower()}",
+        description=description
+        or f"Busca memorias do tipo {kind} parecidas com a consulta informada.",
+    )

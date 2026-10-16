@@ -197,3 +197,32 @@ def test_retrieve_degrada_sem_embedding_e_audita(session, monkeypatch):
 
 def test_retrieve_sem_memoria_retorna_vazio(session):
     assert memory.retrieve(session, db.DIVERGENCE_CASE, "qualquer coisa") == []
+
+
+def test_retriever_devolve_documents_com_metadata(session, company):
+    alvo = _lembrar(
+        session,
+        "documento com container MSCU1234567",
+        item_metadata={"invoice_number": "44120"},
+        source_entity="document",
+        source_id=9,
+        supplier_id=company["supplier"].id,
+    )
+    retriever = memory.RecebaRetriever(session=session, kind=db.EXTRACTION_EXAMPLE, k=3)
+
+    docs = retriever.invoke("MSCU1234567")
+    assert docs[0].page_content == alvo.content
+    assert docs[0].metadata["memory_id"] == alvo.id
+    assert docs[0].metadata["kind"] == db.EXTRACTION_EXAMPLE
+    assert docs[0].metadata["source"] == "document:9"
+    assert docs[0].metadata["invoice_number"] == "44120"
+    assert "lexical" in docs[0].metadata["via"]
+
+
+def test_retriever_tool_e_chamavel_pelo_agente(session):
+    _lembrar(session, "documento com container MSCU1234567")
+    tool = memory.retriever_tool(session, db.EXTRACTION_EXAMPLE, k=2)
+
+    assert tool.name == "buscar_extraction_example"
+    docs = tool.invoke({"query": "MSCU1234567"})
+    assert "MSCU1234567" in docs[0].page_content
