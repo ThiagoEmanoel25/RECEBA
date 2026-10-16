@@ -116,3 +116,10 @@ def make_transaction(session, company):
         return transaction
 
     return _make
+
+
+@pytest.fixture(autouse=True)
+def _sem_chaves_de_ia(monkeypatch):
+    """Suite roda offline: embedding fake e extracao por regex, nunca a rede."""
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
