@@ -167,7 +167,7 @@ def process_document(
     session.commit()
     try:
         text = read_text(os.path.join(STORAGE_DIR, document.storage_key))
-        data, model_name = extract_with_llm(text)
+        data, model_name, memory_ids = extract_with_llm(text, session=session)
     except Exception as exc:  # noqa: BLE001 - erro de extracao nao pode derrubar o doc
         document.status = "ERROR"
         audit(session, "document", document_id, "EXTRACTION_FAILED", error=str(exc)[:300])
@@ -198,7 +198,8 @@ def process_document(
     session.add(extracted)
     document.document_type = data.document_type
     document.status = "EXTRACTED"
-    audit(session, "document", document_id, "DOCUMENT_EXTRACTED", model=model_name)
+    audit(session, "document", document_id, "DOCUMENT_EXTRACTED",
+          model=model_name, memory_ids=memory_ids)
     session.commit()
     return {"id": document_id, "status": document.status, "extracted": extracted.structured_payload}
 

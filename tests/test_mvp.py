@@ -4,9 +4,9 @@ from decimal import Decimal
 
 from sqlalchemy import select
 
-from app import matching
+from app import extract, matching, memory
 from app.bank_import import import_csv, set_balance
-from app.db import Document, ExtractedDocument, Payable, PurchaseOrder, Receivable
+from app.db import EXTRACTION_EXAMPLE, Document, ExtractedDocument, Payable, PurchaseOrder, Receivable
 from app.reconcile import run_daily
 from app.validation import ValidationEngine
 from tests.conftest import TODAY
@@ -198,3 +198,76 @@ def test_import_csv_rejeita_colunas_faltando(session, company):
         assert "obrigatorias" in str(exc)
     else:
         raise AssertionError("deveria recusar CSV invalido")
+
+
+def test_extract_sem_api_key_nao_usa_memoria(session):
+    memory.remember(session, EXTRACTION_EXAMPLE, "exemplo qualquer", cnpj="11222333000181")
+    session.commit()
+
+    documento, modelo, memory_ids = extract.extract_with_llm(
+        "CNPJ 11.222.333/0001-81 Valor Total 7.500,00", session=session
+    )
+    assert modelo == "offline-regex"
+    assert memory_ids == [], "sem LLM nao ha prompt onde injetar exemplo"
+    assert documento.supplier_cnpj == "11222333000181"
+
+
+def test_extract_com_llm_injeta_exemplo_do_mesmo_cnpj(session, monkeypatch):
+    item = memory.remember(
+        session,
+        EXTRACTION_EXAMPLE,
+        "NOTA ACME layout antigo invoice 44120",
+        item_metadata={"invoice_number": "44120", "supplier_name": "ACME LTDA"},
+        cnpj="11222333000181",
+    )
+    session.commit()
+
+    capturado = {}
+
+    class FakeBlock:
+        type = "tool_use"
+        input = {"document_type": "INVOICE", "invoice_number": "44121"}
+
+    class FakeMessages:
+        def create(self, **kwargs):
+            capturado.update(kwargs)
+            return type("R", (), {"content": [FakeBlock()]})()
+
+    class FakeAnthropic:
+        messages = FakeMessages()
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "chave-de-teste")
+    monkeypatch.setattr(extract, "_anthropic_client", lambda: FakeAnthropic())
+
+    documento, modelo, memory_ids = extract.extract_with_llm(
+        "NOTA FISCAL CNPJ 11.222.333/0001-81 invoice 44121", session=session
+    )
+
+    assert memory_ids == [item.id]
+    assert documento.invoice_number == "44121"
+    enviado = capturado["messages"][0]["content"]
+    print("PROMPT_CAPTURADO>>>" + enviado + "<<<")
+    assert "44120" in enviado, "o exemplo corrigido deve entrar no prompt"
+    assert "EXEMPLOS" in enviado
+
+
+def test_extract_com_llm_sem_memoria_mantem_prompt_simples(session, monkeypatch):
+    class FakeBlock:
+        type = "tool_use"
+        input = {"document_type": "INVOICE"}
+
+    capturado = {}
+
+    class FakeMessages:
+        def create(self, **kwargs):
+            capturado.update(kwargs)
+            return type("R", (), {"content": [FakeBlock()]})()
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "chave-de-teste")
+    monkeypatch.setattr(
+        extract, "_anthropic_client", lambda: type("A", (), {"messages": FakeMessages()})()
+    )
+
+    _, _, memory_ids = extract.extract_with_llm("NOTA FISCAL sem historico", session=session)
+    assert memory_ids == []
+    assert "EXEMPLOS" not in capturado["messages"][0]["content"]

@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 
 from pydantic import BaseModel, field_validator
 
+from app.db import EXTRACTION_EXAMPLE
 from app.parser import digits, normalize, parse_observation
 
 MODEL = os.getenv("EXTRACTION_MODEL", "claude-opus-5")
@@ -107,17 +108,55 @@ PROMPT = (
     "Extraia os campos financeiros do documento abaixo. Nao calcule, nao infira valores "
     "que nao estejam escritos e use null quando o campo nao existir no texto.\n\n"
 )
+FEW_SHOT_LIMIT = 3
+FEW_SHOT_CHARS = 1500
 
 
-def extract_with_llm(text: str) -> tuple[FinancialDocument, str]:
-    """Structured output via tool schema. Sem API key, cai no parser deterministico."""
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        return extract_offline(text), "offline-regex"
+def build_few_shot(hits) -> str:
+    """Exemplos corrigidos por humano, do mesmo fornecedor quando possivel."""
+    if not hits:
+        return ""
+    blocos = []
+    for hit in hits:
+        # metadata pode ser None ou parcial (bank_account so com um campo): so serializa.
+        fields = json.dumps(hit.item.item_metadata or {}, ensure_ascii=False, default=str)
+        conteudo = (hit.item.content or "")[:FEW_SHOT_CHARS]
+        blocos.append(f"DOCUMENTO:\n{conteudo}\nCAMPOS CORRETOS:\n{fields}")
+    return (
+        "EXEMPLOS de documentos deste fornecedor ja corrigidos por um humano. "
+        "Use o layout como referencia, nunca copie os valores:\n\n"
+        + "\n\n---\n\n".join(blocos)
+        + "\n\n---\n\n"
+    )
 
+
+def _anthropic_client():
     from anthropic import Anthropic
 
+    return Anthropic()
+
+
+def extract_with_llm(text: str, session=None) -> tuple[FinancialDocument, str, list[int]]:
+    """Structured output via tool schema. Sem API key, cai no parser deterministico."""
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        return extract_offline(text), "offline-regex", []
+
+    # Regex primeiro so para achar o CNPJ: custa zero e dirige a busca na memoria.
+    hits = []
+    if session is not None:
+        from app import memory  # lazy: app.memory importa app.db
+
+        preliminar = extract_offline(text)
+        hits = memory.retrieve(
+            session,
+            EXTRACTION_EXAMPLE,
+            text,
+            filters={"cnpj": preliminar.supplier_cnpj},
+            k=FEW_SHOT_LIMIT,
+        )
+
     schema = FinancialDocument.model_json_schema()
-    response = Anthropic().messages.create(
+    response = _anthropic_client().messages.create(
         model=MODEL,
         max_tokens=2048,
         tools=[{
@@ -130,9 +169,9 @@ def extract_with_llm(text: str) -> tuple[FinancialDocument, str]:
             },
         }],
         tool_choice={"type": "tool", "name": "emit_document"},
-        messages=[{"role": "user", "content": PROMPT + text[:120_000]}],
+        messages=[{"role": "user", "content": PROMPT + build_few_shot(hits) + text[:120_000]}],
     )
     for block in response.content:
         if block.type == "tool_use":
-            return FinancialDocument(**block.input), MODEL
+            return FinancialDocument(**block.input), MODEL, [hit.item.id for hit in hits]
     raise RuntimeError(f"LLM nao retornou tool_use: {json.dumps(response.model_dump())[:400]}")
