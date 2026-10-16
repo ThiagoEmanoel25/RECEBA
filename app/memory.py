@@ -16,8 +16,6 @@ from app.db import MemoryItem, audit
 
 logger = logging.getLogger(__name__)
 
-logger = logging.getLogger(__name__)
-
 
 def _fake_vector(text: str) -> list[float]:
     """Embedding deterministico para rodar offline. Nao tem semantica: so reprodutibilidade."""
