@@ -52,7 +52,13 @@ def test_embed_textos_diferentes_geram_vetores_diferentes():
     assert um != dois
 
 
-def test_embed_lista_vazia():
+def test_embed_lista_vazia_nao_chama_api(monkeypatch):
+    monkeypatch.setenv("VOYAGE_API_KEY", "chave-valida")
+
+    def nao_deve_chamar(*args, **kwargs):
+        raise AssertionError("embed([]) nao deve chamar a API")
+
+    monkeypatch.setattr(memory, "_voyage_client", nao_deve_chamar)
     assert memory.embed([]) == []
 
 

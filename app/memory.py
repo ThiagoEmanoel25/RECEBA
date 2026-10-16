@@ -1,7 +1,9 @@
 """Memoria e RAG hibrido (Spec 1). Nucleo em SQL; LangChain so na borda."""
 from __future__ import annotations
 
+import functools
 import hashlib
+import logging
 import math
 import os
 from dataclasses import dataclass, field
@@ -11,6 +13,8 @@ from sqlalchemy.orm import Session
 
 from app import config
 from app.db import MemoryItem, audit
+
+logger = logging.getLogger(__name__)
 
 
 def _fake_vector(text: str) -> list[float]:
@@ -28,6 +32,7 @@ def _fake_vector(text: str) -> list[float]:
     return [v / norm for v in values]
 
 
+@functools.lru_cache(maxsize=None)  # um cliente por processo: reusa conexao HTTP
 def _voyage_client():
     from langchain_voyageai import VoyageAIEmbeddings
 
@@ -44,7 +49,8 @@ def embed(texts: list[str]) -> list[list[float]] | None:
         return [_fake_vector(text) for text in texts]
     try:
         return _voyage_client().embed_documents(texts)
-    except Exception:  # noqa: BLE001 - qualquer falha de rede/API vira degradacao
+    except Exception:  # noqa: BLE001 - falha de rede/API vira degradacao, mas logada
+        logger.warning("Voyage falhou em embed, degradando", exc_info=True)
         return None
 
 
@@ -54,7 +60,8 @@ def embed_query(text: str) -> list[float] | None:
         return _fake_vector(text)
     try:
         return _voyage_client().embed_query(text)
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 - idem embed, degradacao logada
+        logger.warning("Voyage falhou em embed_query, degradando", exc_info=True)
         return None
 
 
