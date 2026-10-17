@@ -4,11 +4,11 @@ from decimal import Decimal
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app import db, memory
-from app.db import MATCH_DECISION
+from app.db import DIVERGENCE_CASE, MATCH_DECISION
 from app.main import app
 from tests.conftest import TODAY
 
@@ -387,3 +387,56 @@ def test_lote_grava_uma_memoria_por_titulo_com_valor_proprio(client, session, co
     assert por_titulo[p2.id].supplier_id == outro.id
     assert por_titulo[p2.id].amount == Decimal("4500.00")
     assert por_titulo[p2.id].item_metadata["amount"] == "4500.00"
+
+
+def test_aprovacao_de_conciliacao_com_findings_grava_memoria(
+    client, session, company, make_transaction
+):
+    make_transaction("45.00", "TARIFA BANCARIA MENSAL")
+    balance = client.post(
+        "/bank-accounts/balances",
+        headers=HEADERS,
+        json={
+            "bank_account_id": company["account"].id,
+            "balance_date": TODAY.isoformat(),
+            "opening_balance": "0.00",
+            "closing_balance": "-45.00",
+        },
+    )
+    assert balance.status_code == 200
+    execution = client.post(
+        "/reconciliations/run",
+        headers=HEADERS,
+        json={
+            "bank_account_id": company["account"].id,
+            "reconciliation_date": TODAY.isoformat(),
+        },
+    )
+    assert execution.status_code == 200
+
+    approval = client.post(
+        f"/reconciliations/{execution.json()['id']}/approve", headers=HEADERS
+    )
+    assert approval.status_code == 200
+    memory_ids = approval.json()["memory_ids"]
+    assert memory_ids, "findings resolvidos devem virar memoria"
+
+    repeated = client.post(
+        f"/reconciliations/{execution.json()['id']}/approve", headers=HEADERS
+    )
+    assert repeated.status_code == 200
+    assert repeated.json()["memory_ids"] == memory_ids
+    assert session.scalar(
+        select(func.count()).select_from(db.MemoryItem).where(
+            db.MemoryItem.kind == DIVERGENCE_CASE,
+            db.MemoryItem.source_id == execution.json()["id"],
+        )
+    ) == len(memory_ids)
+
+    hits = memory.retrieve(
+        session,
+        DIVERGENCE_CASE,
+        "TARIFA BANCARIA MENSAL",
+        filters={"bank_account_id": company["account"].id},
+    )
+    assert hits

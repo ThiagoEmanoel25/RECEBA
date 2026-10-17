@@ -45,7 +45,8 @@ def _embed_pending(session: Session, transactions: list[BankTransaction]) -> int
     if not transactions:
         return 0
     vectors = memory.embed([t.description_normalized or "" for t in transactions])
-    # Lote parcial conta como falha total: nada e gravado pela metade, o proximo import refaz.
+    # Lote parcial conta como falha total: nada e gravado pela metade. Um backfill posterior
+    # deve reprocessar as linhas sem vetor; a reimportacao as reconhece como duplicadas.
     if vectors is None or len(vectors) != len(transactions):
         audit(session, "bank_account", transactions[0].bank_account_id, "MEMORY_DEGRADED",
               reason="embedding_indisponivel" if vectors is None else "lote_incompleto",

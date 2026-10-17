@@ -2,16 +2,19 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from decimal import Decimal
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app import memory
 from app.config import AMOUNT_TOLERANCE
 from app.db import (
     BankBalance,
     BankTransaction,
     DailyReconciliation,
+    DIVERGENCE_CASE,
     Payable,
     Receivable,
     ReconciliationGroup,
@@ -19,6 +22,36 @@ from app.db import (
 )
 from app.matching import REVIEW_REQUIRED, UNMATCHED
 from app.parser import same_ref
+
+logger = logging.getLogger(__name__)
+SIMILAR_CASES = 3
+
+
+def _similar_cases(session: Session, bank_account_id: int, query: str) -> list[dict]:
+    """Recupera evidencia para o humano sem interferir na conciliacao."""
+    if not query:
+        return []
+    try:
+        with session.begin_nested():
+            hits = memory.retrieve(
+                session,
+                DIVERGENCE_CASE,
+                query,
+                filters={"bank_account_id": bank_account_id},
+                k=SIMILAR_CASES,
+            )
+    except Exception:  # noqa: BLE001 - memoria e consultiva, nunca bloqueia a conciliacao
+        logger.warning("falha ao buscar casos similares; seguindo sem evidencia", exc_info=True)
+        return []
+    return [
+        {
+            "memory_id": hit.item.id,
+            "content": hit.item.content[:300],
+            "resolution": (hit.item.item_metadata or {}).get("resolution"),
+            "score": round(hit.score, 6),
+        }
+        for hit in hits
+    ]
 
 
 def investigate(session: Session, bank_account_id: int, day: dt.date) -> list[dict]:
@@ -38,6 +71,11 @@ def investigate(session: Session, bank_account_id: int, day: dt.date) -> list[di
                 "bank_transaction_id": transaction.id,
                 "amount": str(transaction.amount),
                 "description": transaction.description_raw,
+                "similar_cases": _similar_cases(
+                    session,
+                    bank_account_id,
+                    transaction.description_normalized or transaction.description_raw or "",
+                ),
             })
         elif transaction.status == REVIEW_REQUIRED:
             findings.append({
@@ -69,6 +107,9 @@ def investigate(session: Session, bank_account_id: int, day: dt.date) -> list[di
             "type": "GROUP_DIFFERENCE",
             "group_id": group.id,
             "difference": str(group.difference),
+            "similar_cases": _similar_cases(
+                session, bank_account_id, f"diferenca de grupo {group.difference}"
+            ),
         })
 
     for model, kind in ((Payable, "PAYABLE"), (Receivable, "RECEIVABLE")):

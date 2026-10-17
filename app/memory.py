@@ -244,20 +244,19 @@ class RecebaRetriever(BaseRetriever):
         hits = retrieve(
             self.session, self.kind, query, filters=self.filters, k=self.k
         )
-        return [
-            Document(
-                page_content=hit.item.content,
-                metadata={
-                    **(hit.item.item_metadata or {}),
-                    "memory_id": hit.item.id,
-                    "kind": hit.item.kind,
-                    "score": hit.score,
-                    "via": sorted(hit.via),
-                    "source": f"{hit.item.source_entity}:{hit.item.source_id}",
-                },
-            )
-            for hit in hits
-        ]
+        documents = []
+        for hit in hits:
+            metadata = {
+                **(hit.item.item_metadata or {}),
+                "memory_id": hit.item.id,
+                "kind": hit.item.kind,
+                "score": hit.score,
+                "via": sorted(hit.via),
+            }
+            if hit.item.source_entity is not None and hit.item.source_id is not None:
+                metadata["source"] = f"{hit.item.source_entity}:{hit.item.source_id}"
+            documents.append(Document(page_content=hit.item.content, metadata=metadata))
+        return documents
 
 
 def retriever_tool(

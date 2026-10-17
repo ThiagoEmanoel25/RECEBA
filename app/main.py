@@ -17,6 +17,7 @@ from app import bank_import, matching, memory, reconcile
 from app.config import ALLOWED_MIME, API_KEYS, MAX_UPLOAD_BYTES, STORAGE_DIR
 from app.db import (
     BankTransaction,
+    DIVERGENCE_CASE,
     EXTRACTION_EXAMPLE,
     Document,
     ExtractedDocument,
@@ -804,11 +805,38 @@ def approve_reconciliation(
     record = session.get(DailyReconciliation, reconciliation_id)
     if record is None:
         raise HTTPException(404, "Conciliacao inexistente")
+    existing_memory_ids = list(session.scalars(
+        select(MemoryItem.id).where(
+            MemoryItem.kind == DIVERGENCE_CASE,
+            MemoryItem.source_entity == "daily_reconciliation",
+            MemoryItem.source_id == record.id,
+        ).order_by(MemoryItem.id)
+    ))
+    if record.status == "APPROVED":
+        return {"id": record.id, "status": record.status, "memory_ids": existing_memory_ids}
     record.status = "APPROVED"
+
+    memory_ids = []
+    for finding in (record.findings or {}).get("items", []):
+        content = finding.get("description") or f"{finding.get('type')} {finding}"
+        item = memory.remember(
+            session,
+            DIVERGENCE_CASE,
+            content[:2000],
+            item_metadata={
+                "finding": finding,
+                "resolution": f"aprovada na conciliacao {record.id} por {actor.key}",
+            },
+            source_entity="daily_reconciliation",
+            source_id=record.id,
+            bank_account_id=record.bank_account_id,
+        )
+        memory_ids.append(item.id)
+
     audit(session, "daily_reconciliation", record.id, "HUMAN_APPROVED",
-          actor_type="USER", actor_id=actor.key)
+          actor_type="USER", actor_id=actor.key, memory_ids=memory_ids)
     session.commit()
-    return {"id": record.id, "status": record.status}
+    return {"id": record.id, "status": record.status, "memory_ids": memory_ids}
 
 
 # ---- metricas (spec secoes 37 e 42) ---------------------------------------

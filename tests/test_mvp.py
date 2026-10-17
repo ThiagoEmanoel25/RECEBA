@@ -4,10 +4,11 @@ from decimal import Decimal
 
 from sqlalchemy import select, text
 
-from app import db, extract, matching, memory
+from app import db, extract, matching, memory, reconcile
 from app.bank_import import import_csv, set_balance
 from app.config import EMBEDDING_DIM
 from app.db import (
+    DIVERGENCE_CASE,
     EXTRACTION_EXAMPLE,
     MATCH_DECISION,
     Document,
@@ -489,7 +490,7 @@ def test_reimportacao_identica_nao_chama_embed(session, company, monkeypatch):
 
 
 def _memoria_de_match(session, company, payable, decision, descricao):
-    memory.remember(
+    item = memory.remember(
         session,
         MATCH_DECISION,
         descricao,
@@ -502,6 +503,7 @@ def _memoria_de_match(session, company, payable, decision, descricao):
         bank_account_id=company["account"].id,
     )
     session.commit()
+    return item
 
 
 def test_history_sozinho_nao_gera_auto_match(session, company, make_payable, make_transaction):
@@ -640,3 +642,64 @@ def test_matching_funciona_sem_nenhuma_memoria(session, make_payable, make_trans
     resultado, pool = matching.evaluate(session, transaction)
     assert resultado.status == matching.AUTO_MATCHED
     assert all(c.history == 0 for c in pool)
+
+
+def test_matching_audita_memoria_usada(session, company, make_payable, make_transaction):
+    payable = make_payable("44120", "500.00")
+    descricao = "TRANSFERENCIA ACME 11222333000181"
+    transaction = make_transaction("500.00", descricao)
+    item = _memoria_de_match(session, company, payable, "APPROVED", descricao)
+
+    resultado, _ = matching.run(session, transaction)
+
+    assert resultado.status == matching.REVIEW_REQUIRED
+    evento = session.scalar(
+        select(db.AuditEvent).where(
+            db.AuditEvent.entity_type == "bank_transaction",
+            db.AuditEvent.entity_id == str(transaction.id),
+            db.AuditEvent.event_type == matching.REVIEW_REQUIRED,
+        )
+    )
+    assert evento.event_metadata["memory_ids"] == [item.id]
+
+
+def test_finding_traz_casos_parecidos(session, company, make_transaction):
+    memory.remember(
+        session,
+        DIVERGENCE_CASE,
+        "TARIFA BANCARIA MENSAL nao mapeada",
+        item_metadata={"resolution": "lancada como despesa bancaria"},
+        bank_account_id=company["account"].id,
+    )
+    session.commit()
+    make_transaction("45.00", "TARIFA BANCARIA MENSAL")
+
+    findings = reconcile.investigate(session, company["account"].id, TODAY)
+    nao_mapeada = [f for f in findings if f["type"] == "TRANSACTION_NOT_MAPPED"]
+    assert nao_mapeada
+    similares = nao_mapeada[0]["similar_cases"]
+    assert similares and similares[0]["resolution"] == "lancada como despesa bancaria"
+
+
+def test_finding_sem_historico_traz_lista_vazia(session, company, make_transaction):
+    make_transaction("45.00", "TARIFA BANCARIA MENSAL")
+
+    findings = reconcile.investigate(session, company["account"].id, TODAY)
+    nao_mapeada = [f for f in findings if f["type"] == "TRANSACTION_NOT_MAPPED"]
+    assert nao_mapeada[0]["similar_cases"] == []
+
+
+def test_finding_sobrevive_a_falha_da_memoria(
+    session, company, make_transaction, monkeypatch
+):
+    make_transaction("45.00", "TARIFA BANCARIA MENSAL")
+
+    def explode(sess, *args, **kwargs):
+        sess.execute(text("select 1/0"))
+
+    monkeypatch.setattr(memory, "retrieve", explode)
+    findings = reconcile.investigate(session, company["account"].id, TODAY)
+
+    nao_mapeada = [f for f in findings if f["type"] == "TRANSACTION_NOT_MAPPED"]
+    assert nao_mapeada[0]["similar_cases"] == []
+    assert session.execute(select(1)).scalar() == 1

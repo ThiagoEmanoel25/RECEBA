@@ -5,6 +5,7 @@ from decimal import Decimal
 
 import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -25,6 +26,11 @@ SKIP_MESSAGE = (
 @pytest.fixture(scope="session")
 def engine():
     """Schema criado uma vez por sessao de teste; cada teste roda em transacao propria."""
+    database = make_url(TEST_DATABASE_URL).database or ""
+    if not database.endswith("_test"):
+        raise RuntimeError(
+            f"TEST_DATABASE_URL deve apontar para um banco terminado em '_test', nao {database!r}"
+        )
     eng = create_engine(TEST_DATABASE_URL, future=True)
     try:
         with eng.begin() as connection:

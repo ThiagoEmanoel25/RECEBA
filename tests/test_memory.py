@@ -226,3 +226,4 @@ def test_retriever_tool_e_chamavel_pelo_agente(session):
     assert tool.name == "buscar_extraction_example"
     docs = tool.invoke({"query": "MSCU1234567"})
     assert "MSCU1234567" in docs[0].page_content
+    assert "source" not in docs[0].metadata

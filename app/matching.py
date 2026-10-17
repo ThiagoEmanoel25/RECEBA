@@ -58,6 +58,7 @@ class Scored:
     score: int  # score base: so sinais do documento. O teto da memoria mora aqui.
     reasons: list[str] = field(default_factory=list)
     history: int = 0  # ajuste vindo da memoria; nunca entra no score base
+    memory_ids: list[int] = field(default_factory=list)
 
     @property
     def id(self) -> int:
@@ -156,7 +157,7 @@ def apply_history(session: Session, transaction: BankTransaction, pool: list[Sco
     # (NF/NSU/data variando) quase nunca dispara. Upgrade: Hit levar a distancia cosseno para
     # aceitar hit semantico acima de um limiar, e/ou websearch_to_tsquery no lado lexical.
     # Conflito APPROVED x REJECTED na mesma parte: rejeicao vence (conservador), nao a mais antiga.
-    by_party: dict[tuple[str, int], str] = {}
+    by_party: dict[tuple[str, int], tuple[str, int]] = {}
     for hit in hits:
         if "lexical" not in hit.via:
             continue
@@ -165,8 +166,9 @@ def apply_history(session: Session, transaction: BankTransaction, pool: list[Sco
             continue
         for column, value in (("supplier", hit.item.supplier_id),
                               ("customer", hit.item.customer_id)):
-            if value is not None and (decision == "REJECTED" or (column, value) not in by_party):
-                by_party[(column, value)] = decision
+            key = (column, value)
+            if value is not None and (decision == "REJECTED" or key not in by_party):
+                by_party[key] = (decision, hit.item.id)
     if not by_party:
         return
 
@@ -175,7 +177,11 @@ def apply_history(session: Session, transaction: BankTransaction, pool: list[Sco
         if party is None:
             continue
         key = ("supplier" if isinstance(candidate.entity, Payable) else "customer", party.id)
-        decision = by_party.get(key)
+        remembered = by_party.get(key)
+        if remembered is None:
+            continue
+        decision, memory_id = remembered
+        candidate.memory_ids.append(memory_id)
         if decision == "APPROVED":
             candidate.history = weight
             candidate.reasons.append("history")
@@ -409,6 +415,7 @@ def run(session: Session, transaction: BankTransaction, auto_settle: bool = True
         session, "bank_transaction", transaction.id, result.status,
         score=result.confidence, reasons=result.reasons,
         group_id=group.id if group is not None else None,
+        memory_ids=sorted({item for candidate in pool for item in candidate.memory_ids}),
     )
     session.commit()
     return result, group
