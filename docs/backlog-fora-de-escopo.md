@@ -4,7 +4,7 @@ Itens adiados de propósito. Cada um diz **quando** passa a valer a pena.
 
 | item | por que ficou de fora | entra quando |
 |---|---|---|
-| **Agente LangGraph** (Spec 2) | precisa da memória e das ferramentas prontas primeiro | Spec 1 entregue; candidatos: investigação de divergências e re-extração com autocorreção |
+| **Agente LangGraph** (Spec 2) | precisava da memória e das ferramentas prontas primeiro | spec pronta em `docs/superpowers/specs/2026-10-18-agente-producao-evals-rag-observabilidade-design.md`; implementar pelo plano correspondente |
 | **Reranker** (Voyage/Cohere rerank) | RRF basta para começar | métricas mostrarem recuperação ruim no top-k |
 | **Esquecimento / expiração de memória** | volume inicial pequeno | memórias velhas começarem a atrapalhar (ex.: fornecedor mudou layout ou conta) |
 | **UI de curadoria de memória** | sem usuário pedindo | analistas precisarem apagar ou editar memórias erradas |
