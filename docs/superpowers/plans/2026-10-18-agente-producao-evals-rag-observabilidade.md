@@ -2,6 +2,23 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-18-agente-producao-evals-rag-observabilidade-design.md`
 
+## Status de implementacao
+
+- [x] Task 1 — contratos, fixtures e ferramentas read-only
+- [x] Task 2 — persistencia e observabilidade de dominio
+- [x] Task 3 — dataset v1, scorers e runner offline
+- [x] Task 4 — grafo LangGraph com orcamento e allowlist
+- [ ] Task 5 — human-in-the-loop persistente
+- [ ] Task 6 — API do agente
+- [ ] Task 7 — reranker e eval de retrieval
+- [ ] Task 8 — OpenTelemetry, metricas e orcamento
+- [ ] Task 9 — servidor MCP read-only
+- [ ] Task 10 — reliability, seguranca e carga
+- [ ] Task 11 — prova operacional e material de entrevista
+
+Checkpoint em 2026-10-20: 105 testes verdes. O runner da Task 3 usa adapter fixture
+deterministico para validar dataset/scorers; o primeiro baseline do grafo real nasce na Task 4.
+
 ## Ordem de execução
 
 Cada task termina com testes focais e suíte completa. Mudança de prompt/modelo não pode ser
