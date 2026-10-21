@@ -44,3 +44,13 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "voyage-3.5")
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", 1024))
 RETRIEVE_CANDIDATES = int(os.getenv("RETRIEVE_CANDIDATES", 20))  # top-N por canal antes do RRF
 HISTORY_HITS = int(os.getenv("HISTORY_HITS", 5))  # memorias de match lidas por transacao
+
+# ---- agente de investigacao ----------------------------------------------
+AGENT_MODEL = os.getenv("AGENT_MODEL", "claude-sonnet-4-5")
+AGENT_MAX_CYCLES = int(os.getenv("AGENT_MAX_CYCLES", 3))
+AGENT_MAX_TOOL_CALLS = int(os.getenv("AGENT_MAX_TOOL_CALLS", 8))
+AGENT_MAX_INPUT_TOKENS = int(os.getenv("AGENT_MAX_INPUT_TOKENS", 12_000))
+AGENT_MAX_OUTPUT_TOKENS = int(os.getenv("AGENT_MAX_OUTPUT_TOKENS", 2_000))
+AGENT_MAX_COST_USD = Decimal(os.getenv("AGENT_MAX_COST_USD", "0.25"))
+AGENT_PROMPT_VERSION = os.getenv("AGENT_PROMPT_VERSION", "investigation-v1")
+AGENT_RETRIEVAL_VERSION = os.getenv("AGENT_RETRIEVAL_VERSION", "rrf-v1")

@@ -8,6 +8,7 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Computed,
     Date,
     DateTime,
@@ -309,6 +310,100 @@ class MemoryItem(Base, TimestampMixin):
     item_metadata: Mapped[dict | None] = mapped_column(JSONB)
     source_entity: Mapped[str | None] = mapped_column(String(40))
     source_id: Mapped[int | None] = mapped_column()
+
+
+class AgentRun(Base, TimestampMixin):
+    """Execucao persistida do agente; payloads financeiros crus nao entram aqui."""
+
+    __tablename__ = "agent_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "(daily_reconciliation_id IS NULL) <> (reconciliation_group_id IS NULL)",
+            name="ck_agent_runs_exactly_one_case",
+        ),
+    )
+    run_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    thread_id: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    actor_id: Mapped[str] = mapped_column(String(80))
+    bank_account_id: Mapped[int] = mapped_column(ForeignKey("bank_accounts.id"), index=True)
+    daily_reconciliation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("daily_reconciliations.id"), index=True
+    )
+    reconciliation_group_id: Mapped[int | None] = mapped_column(
+        ForeignKey("reconciliation_groups.id"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(25), index=True)
+    model: Mapped[str] = mapped_column(String(100))
+    prompt_version: Mapped[str] = mapped_column(String(80))
+    retrieval_version: Mapped[str] = mapped_column(String(80))
+    pricing_version: Mapped[str | None] = mapped_column(String(80))
+    started_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    latency_ms: Mapped[int | None] = mapped_column()
+    input_tokens: Mapped[int] = mapped_column(default=0)
+    output_tokens: Mapped[int] = mapped_column(default=0)
+    estimated_cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    cost_complete: Mapped[bool] = mapped_column(Boolean, default=True)
+    next_step_sequence: Mapped[int] = mapped_column(default=1)
+    recommendation: Mapped[dict | None] = mapped_column(JSONB)
+    human_feedback: Mapped[dict | None] = mapped_column(JSONB)
+    error_code: Mapped[str | None] = mapped_column(String(80))
+
+
+class AgentStep(Base):
+    """Etapa observavel de um run; conteudo fica representado apenas por hash."""
+
+    __tablename__ = "agent_steps"
+    __table_args__ = (UniqueConstraint("run_id", "sequence"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.run_id"), index=True)
+    sequence: Mapped[int] = mapped_column()
+    name: Mapped[str] = mapped_column(String(100))
+    kind: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20))
+    started_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    latency_ms: Mapped[int | None] = mapped_column()
+    input_tokens: Mapped[int | None] = mapped_column()
+    output_tokens: Mapped[int | None] = mapped_column()
+    estimated_cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    input_hash: Mapped[str | None] = mapped_column(String(64))
+    output_hash: Mapped[str | None] = mapped_column(String(64))
+    safe_attributes: Mapped[dict | None] = mapped_column(JSONB)
+    error_class: Mapped[str | None] = mapped_column(String(120))
+
+
+class EvalRun(Base, TimestampMixin):
+    __tablename__ = "eval_runs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    dataset: Mapped[str] = mapped_column(String(120), index=True)
+    dataset_version: Mapped[str] = mapped_column(String(80))
+    dataset_hash: Mapped[str] = mapped_column(String(64))
+    git_sha: Mapped[str] = mapped_column(String(40))
+    git_dirty: Mapped[bool] = mapped_column(Boolean)
+    prompt_hash: Mapped[str] = mapped_column(String(64))
+    model: Mapped[str] = mapped_column(String(100))
+    retrieval_version: Mapped[str] = mapped_column(String(80))
+    reranker_version: Mapped[str | None] = mapped_column(String(80))
+    configuration: Mapped[dict] = mapped_column(JSONB)
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    metrics: Mapped[dict | None] = mapped_column(JSONB)
+    finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class EvalCaseResult(Base, TimestampMixin):
+    __tablename__ = "eval_case_results"
+    __table_args__ = (UniqueConstraint("eval_run_id", "case_id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    eval_run_id: Mapped[int] = mapped_column(ForeignKey("eval_runs.id"), index=True)
+    case_id: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    scores: Mapped[dict] = mapped_column(JSONB)
+    result_hash: Mapped[str] = mapped_column(String(64))
+    latency_ms: Mapped[int | None] = mapped_column()
+    input_tokens: Mapped[int | None] = mapped_column()
+    output_tokens: Mapped[int | None] = mapped_column()
+    estimated_cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
 
 
 def audit(
