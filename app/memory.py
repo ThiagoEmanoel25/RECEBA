@@ -83,6 +83,12 @@ class Hit:
     via: set[str] = field(default_factory=set)
 
 
+@dataclass(slots=True)
+class RetrievalOutcome:
+    hits: list[Hit]
+    degraded: bool = False
+
+
 def remember(
     session: Session,
     kind: str,
@@ -117,14 +123,15 @@ def _as_vector_literal(vector: list[float]) -> str:
     return "[" + ",".join(repr(float(value)) for value in vector) + "]"
 
 
-def retrieve(
+def retrieve_outcome(
     session: Session,
     kind: str,
     query: str,
     *,
     filters: dict | None = None,
     k: int = 5,
-) -> list[Hit]:
+    audit_degradation: bool = True,
+) -> RetrievalOutcome:
     """Busca hibrida: filtro estruturado -> full-text + vetor -> fusao RRF.
 
     Pode gravar um audit MEMORY_DEGRADED (sem embedding); quem chama decide commit/rollback.
@@ -151,7 +158,15 @@ def retrieve(
     vector = embed_query(query)
     if vector is None:
         logger.warning("memoria degradada para kind=%s: embedding indisponivel", kind)
-        audit(session, "memory", kind, "MEMORY_DEGRADED", kind=kind, reason="embedding_indisponivel")
+        if audit_degradation:
+            audit(
+                session,
+                "memory",
+                kind,
+                "MEMORY_DEGRADED",
+                kind=kind,
+                reason="embedding_indisponivel",
+            )
     else:
         params["vector"] = _as_vector_literal(vector)
 
@@ -209,7 +224,7 @@ def retrieve(
 
     rows = session.execute(sql, params).all()
     if not rows:
-        return []
+        return RetrievalOutcome(hits=[], degraded=vector is None)
 
     items = {
         item.id: item
@@ -225,7 +240,21 @@ def retrieve(
         if row.via_semantic:
             via.add("semantic")
         hits.append(Hit(item=items[row.id], score=float(row.score), via=via))
-    return hits
+    return RetrievalOutcome(hits=hits, degraded=vector is None)
+
+
+def retrieve(
+    session: Session,
+    kind: str,
+    query: str,
+    *,
+    filters: dict | None = None,
+    k: int = 5,
+) -> list[Hit]:
+    """Compatibilidade da Spec 1: busca e registra degradacao no audit do chamador."""
+    return retrieve_outcome(
+        session, kind, query, filters=filters, k=k, audit_degradation=True
+    ).hits
 
 
 class RecebaRetriever(BaseRetriever):
