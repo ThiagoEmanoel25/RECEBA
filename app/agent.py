@@ -8,11 +8,13 @@ from typing import Annotated, Any, Literal, Protocol
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from langgraph.types import interrupt
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 from typing_extensions import TypedDict
 
-from app import config
+from app import config, db
 from app.agent_tools import (
     AgentToolContext,
     AgentToolError,
@@ -58,6 +60,43 @@ class PlanDecision(BaseModel):
 class ComposeDecision(BaseModel):
     recommendation: InvestigationRecommendation
     usage: ModelUsage
+
+
+class HumanFeedback(BaseModel):
+    """Decisao humana validada no ponto de retomada do grafo."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["accepted", "edited", "rejected"]
+    actor_id: str = Field(min_length=1, max_length=80)
+    note: str | None = Field(default=None, max_length=2000)
+    recommendation: InvestigationRecommendation | None = None
+
+    @model_validator(mode="after")
+    def edited_requires_recommendation(self) -> HumanFeedback:
+        if (self.decision == "edited") != (self.recommendation is not None):
+            raise ValueError(
+                "Feedback edited exige recommendation; outros tipos nao permitem edicao"
+            )
+        return self
+
+
+class HumanReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    recommendation: InvestigationRecommendation
+    evidence: list[dict[str, Any]] = Field(max_length=50)
+    editable_fields: tuple[str, ...] = (
+        "classification",
+        "summary",
+        "hypothesis",
+        "recommended_action",
+        "confidence",
+        "evidence",
+        "claims",
+        "missing_information",
+    )
 
 
 class ModelGateway(Protocol):
@@ -397,15 +436,69 @@ def _compose(
 
 
 def _human_review(state: InvestigationState) -> dict[str, Any]:
-    # Task 5 troca este marcador por interrupt() persistente e tipado.
     if state.get("status") != "RECOMMENDATION_READY":
         return {}
-    return {"status": "WAITING_HUMAN"}
+    request = HumanReviewRequest(
+        run_id=state["run_id"],
+        recommendation=InvestigationRecommendation.model_validate(
+            state["recommendation"]
+        ),
+        evidence=state.get("evidence", []),
+    )
+    feedback = interrupt(
+        request.model_dump(mode="json"), response_schema=HumanFeedback
+    )
+    validated = HumanFeedback.model_validate(feedback)
+    return {
+        "human_feedback": validated.model_dump(mode="json"),
+        "status": "REVIEWED",
+    }
 
 
-def _record_feedback(state: InvestigationState) -> dict[str, Any]:
-    # Node declarado desde ja; Task 5 o liga ao resume idempotente.
-    return {"status": "COMPLETED" if state.get("human_feedback") else state["status"]}
+def _record_feedback(
+    state: InvestigationState, runtime: Runtime[AgentRuntimeContext]
+) -> dict[str, Any]:
+    """Persiste uma unica decisao por run, mesmo se o resume for repetido."""
+    feedback = HumanFeedback.model_validate(state.get("human_feedback"))
+    final_recommendation = (
+        feedback.recommendation.model_dump(mode="json")
+        if feedback.recommendation is not None
+        else state["recommendation"]
+    )
+    serialized_feedback = feedback.model_dump(mode="json", exclude_none=True)
+    with runtime.context.session_factory() as session, session.begin():
+        run = session.scalar(
+            select(db.AgentRun)
+            .where(db.AgentRun.run_id == state["run_id"])
+            .with_for_update()
+        )
+        if run is None:
+            raise ValueError("Run inexistente ao registrar feedback")
+        if run.human_feedback is not None:
+            if run.human_feedback != serialized_feedback:
+                raise ValueError("Run ja possui uma decisao humana diferente")
+            return {
+                "human_feedback": run.human_feedback,
+                "recommendation": run.recommendation,
+                "status": run.status,
+            }
+        run.human_feedback = serialized_feedback
+        run.recommendation = final_recommendation
+        run.status = "COMPLETED"
+        db.audit(
+            session,
+            "agent_run",
+            run.run_id,
+            "HUMAN_FEEDBACK_RECORDED",
+            actor_type="USER",
+            actor_id=feedback.actor_id,
+            decision=feedback.decision,
+        )
+    return {
+        "human_feedback": serialized_feedback,
+        "recommendation": final_recommendation,
+        "status": "COMPLETED",
+    }
 
 
 def _route_after_plan(state: InvestigationState) -> str:
@@ -416,6 +509,10 @@ def _route_after_plan(state: InvestigationState) -> str:
 
 def _route_after_grade(state: InvestigationState) -> str:
     return END if state.get("status") != "RUNNING" else "plan"
+
+
+def _route_after_compose(state: InvestigationState) -> str:
+    return "human_review" if state.get("status") == "RECOMMENDATION_READY" else END
 
 
 def build_graph(*, checkpointer=None):
@@ -432,6 +529,9 @@ def build_graph(*, checkpointer=None):
     builder.add_conditional_edges("plan", _route_after_plan, ["tools", "compose", END])
     builder.add_edge("tools", "grade_evidence")
     builder.add_conditional_edges("grade_evidence", _route_after_grade, ["plan", END])
-    builder.add_edge("compose", "human_review")
-    builder.add_edge("human_review", END)
+    builder.add_conditional_edges(
+        "compose", _route_after_compose, ["human_review", END]
+    )
+    builder.add_edge("human_review", "record_feedback")
+    builder.add_edge("record_feedback", END)
     return builder.compile(checkpointer=checkpointer)
