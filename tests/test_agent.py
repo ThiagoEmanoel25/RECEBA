@@ -107,7 +107,8 @@ def test_graph_reads_evidence_and_stops_for_human(session, connection):
         context=_runtime(connection, materialized, gateway),
     )
 
-    assert result["status"] == "WAITING_HUMAN"
+    assert result["status"] == "RECOMMENDATION_READY"
+    assert len(result["__interrupt__"]) == 1
     assert result["recommendation"]["requires_human"] is True
     assert [call["name"] for call in result["tool_calls"]] == ["get_transaction"]
     assert result["safety_violations"] == []

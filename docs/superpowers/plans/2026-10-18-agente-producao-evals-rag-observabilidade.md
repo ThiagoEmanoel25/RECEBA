@@ -8,7 +8,7 @@
 - [x] Task 2 — persistencia e observabilidade de dominio
 - [x] Task 3 — dataset v1, scorers e runner offline
 - [x] Task 4 — grafo LangGraph com orcamento e allowlist
-- [ ] Task 5 — human-in-the-loop persistente
+- [x] Task 5 — human-in-the-loop persistente
 - [ ] Task 6 — API do agente
 - [ ] Task 7 — reranker e eval de retrieval
 - [ ] Task 8 — OpenTelemetry, metricas e orcamento
